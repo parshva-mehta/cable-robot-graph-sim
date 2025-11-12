@@ -51,10 +51,10 @@ def build_mlp(
 
 
 class RecurrentType(Enum):
-    LSTM = 1
-    GRU = 2
-    RNN = 3
-    MLP = 4
+    LSTM = 'lstm'
+    GRU = 'gru'
+    RNN = 'rnn'
+    MLP = 'mlp'
 
 
 class Encoder(nn.Module):
@@ -104,24 +104,24 @@ class Encoder(nn.Module):
             name: mlp(in_dim, n_out) for name, in_dim in edge_types.items()
         })
 
-        self.recurrent_type = recurrent_type
+        self.recurrent_type = RecurrentType(recurrent_type) if recurrent_type else None
 
         recurr_block_fn = lambda cell: nn.Sequential(cell, nn.LayerNorm(n_out))
         self.node_recur_layer_norm = nn.LayerNorm(n_out)
 
-        if recurrent_type == RecurrentType.LSTM:
+        if self.recurrent_type == RecurrentType.MLP:
             self.node_recurrent_block = mlp(2 * n_out, n_out, 2)
             self.cable_recurrent_block = mlp(2 * n_out, n_out, 2)
             self.recur_fwd_fn = self.mlp_forward
-        elif recurrent_type == RecurrentType.GRU:
+        elif self.recurrent_type == RecurrentType.GRU:
             self.node_recurrent_block = recurr_block_fn(nn.RNNCell(n_out, n_out))
             self.cable_recurrent_block = recurr_block_fn(nn.RNNCell(n_out, n_out))
             self.recur_fwd_fn = self.rnn_gru_forward
-        elif recurrent_type == RecurrentType.LSTM:
+        elif self.recurrent_type == RecurrentType.LSTM:
             self.node_recurrent_block = nn.LSTMCell(n_out, n_out)
             self.node_lstm_layer_norm = nn.LayerNorm(n_out)
             self.recur_fwd_fn = self.lstm_forward
-        elif recurrent_type == RecurrentType.RNN:
+        elif self.recurrent_type == RecurrentType.RNN:
             self.node_recurrent_block = recurr_block_fn(nn.GRUCell(n_out, n_out))
             self.cable_recurrent_block = recurr_block_fn(nn.GRUCell(n_out, n_out))
             self.recur_fwd_fn = self.rnn_gru_forward
@@ -431,10 +431,12 @@ class Decoder(nn.Module):
 
         self.cable_decode_fn = None
         if use_cable_decoder:
+            assert nnode_out % 3 == 0
+            n_cable_out = nnode_out // 3
             self.cable_decode_fn = build_mlp(
                 nnode_in,
                 [mlp_hidden_dim for _ in range(nmlp_layers)],
-                nnode_out
+                n_cable_out
             )
 
     def forward(self, graph_batch: GraphData) -> GraphData:
@@ -447,7 +449,7 @@ class Decoder(nn.Module):
         graph_batch['decode_output'] = self.node_decode_fn(graph_batch['x'])
         if self.cable_decode_fn is not None:
             graph_batch['cable_decode_output'] = (
-                self.cable_edge_decode_fn(graph_batch['cable_edge_attr'])
+                self.cable_decode_fn(graph_batch['cable_edge_attr'])
             )
 
         return graph_batch
@@ -465,7 +467,7 @@ class EncodeProcessDecode(nn.Module):
             nmlp_layers: int,
             mlp_hidden_dim: int,
             processor_shared_weights: bool = False,
-            recurrent_type: RecurrentType = None,
+            recurrent_type: RecurrentType | None = None,
             use_cable_decoder: bool = False,
     ):
         """

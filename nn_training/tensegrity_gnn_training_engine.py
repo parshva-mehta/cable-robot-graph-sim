@@ -2,19 +2,19 @@ import json
 import logging
 import os
 import random
-import time
 from copy import deepcopy
 from pathlib import Path
+from typing import Union, Tuple
 
 import numpy as np
-import torch
-import tqdm
+from torch import nn
 from torch.nn.modules.loss import _Loss
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data as Graph
 
 from nn_training.datasets.tensegrity_dataset import TensegrityDataset, TensegrityMultiSimMotorDataset, \
     TensegrityMultiSimDataset
+from simulators.abstract_simulator import AbstractSimulator
 from simulators.tensegrity_gnn_simulator import *
 from state_objects.primitive_shapes import Cylinder
 from utilities import torch_quaternion
@@ -64,8 +64,6 @@ class TensegrityGNNTrainingEngine(nn.Module):
 
     def __init__(self,
                  training_config: Dict,
-                 criterion: _Loss,
-                 dt: Union[float, torch.Tensor],
                  logger: logging.Logger):
         super().__init__()
         self.sim_config = training_config['sim_config']
@@ -75,11 +73,11 @@ class TensegrityGNNTrainingEngine(nn.Module):
 
         # self.sim_config['n_out'] = 3 * training_config['num_out_steps']
 
-        self.dt = dt
+        self.dt = self.sim_config['dt']
         self.dtype = DEFAULT_DTYPE
         self.device = 'cpu'
         self.config = training_config
-        self.simulator = self.get_dummy_simulator()
+        # self.simulator = self.get_dummy_simulator()
         self.num_steps_fwd = self.config.get('num_steps_fwd', 1)
         self.num_hist = self.config.get('num_hist', 1)
         self.save_rollout_vids = self.config.get('save_rollout_vids', False)
@@ -136,7 +134,7 @@ class TensegrityGNNTrainingEngine(nn.Module):
             collate_fn=self.val_dataset.collate_fn
         )
 
-        delattr(self, "simulator")
+        # delattr(self, "simulator")
         self.simulator = self.get_simulator()
 
         self.trainable_params = torch.nn.ParameterList(self.simulator.parameters())
@@ -149,7 +147,7 @@ class TensegrityGNNTrainingEngine(nn.Module):
             20,
             1e-8
         )
-        self.loss_fn = criterion
+        self.loss_fn = torch.nn.MSELoss()
 
     def _get_dataset(self, data_dict):
         return TensegrityDataset(
@@ -173,11 +171,11 @@ class TensegrityGNNTrainingEngine(nn.Module):
         code_output = Path(self.output_dir, code_dir_name)
         save_curr_code(curr_code_dir, code_output)
 
-    def get_dummy_simulator(self):
-        sim = Tensegrity5dRobotSimulator(self.sim_config['tensegrity_cfg'],
-                                         self.sim_config['gravity'],
-                                         self.sim_config['contact_params'])
-        return sim
+    # def get_dummy_simulator(self):
+    #     sim = Tensegrity5dRobotSimulator(self.sim_config['tensegrity_cfg'],
+    #                                      self.sim_config['gravity'],
+    #                                      self.sim_config['contact_params'])
+    #     return sim
 
     def get_simulator(self):
         if self.load_sim and self.load_sim_path:
@@ -288,7 +286,8 @@ class TensegrityGNNTrainingEngine(nn.Module):
         return data_pos, data_quats, data_controls
 
     def pos_quat_to_states(self, data_pos, data_quats, times, data_vels):
-        num_rods = len(self.simulator.robot.rigid_bodies)
+        # num_rods = len(self.simulator.robot.rigid_bodies)
+        num_rods = 3
 
         data_states = []
         for k, (pos, quats, times) in enumerate(zip(data_pos, data_quats, times)):
@@ -342,8 +341,9 @@ class TensegrityGNNTrainingEngine(nn.Module):
         return data_states, data_controls
 
     def get_act_lens_motor_omegas(self, extra_state_jsons, times):
-        act_cables = self.simulator.robot.actuated_cables.values()
-        _rest_lengths = [s._rest_length for s in act_cables]
+        # act_cables = self.simulator.robot.actuated_cables.values()
+        _rest_lengths = [2.7] * 6
+        max_omega = 0.7 * 220 * 2 * np.pi / 60
 
         data_act_lens, data_motor_omegas = [], []
 
@@ -359,10 +359,10 @@ class TensegrityGNNTrainingEngine(nn.Module):
                 if 'motor_speeds' in e:
                     motor_speeds = e['motor_speeds']
                 else:
-                    last_ctrls = extra_state_json[i - 1]['controls'] if i > 0 else [0.0] * len(act_cables)
+                    last_ctrls = extra_state_json[i - 1]['controls'] if i > 0 else [0.0] * len(range(6))
                     motor_speeds = [
-                        ctrl * cable.motor.max_omega * cable.motor.speed
-                        for cable, ctrl in zip(act_cables, last_ctrls)
+                        ctrl * max_omega
+                        for ctrl in last_ctrls
                     ]
                 motor_speeds = torch.tensor(
                     motor_speeds,
@@ -955,11 +955,10 @@ class TensegrityRecurrentMotorGNNTrainingEngine(TensegrityGNNTrainingEngine):
 
     def __init__(self,
                  training_config: Dict,
-                 criterion: _Loss,
-                 dt: Union[float, torch.Tensor]):
-        self.num_ctrls_hist = training_config.get('num_ctrls_hist', self.num_hist)
+                 criterion: _Loss):
+        self.num_ctrls_hist = self.sim_config.get('num_ctrls_hist', 1)
         self.use_gt_cable_dl = training_config.get('use_gt_cable_dl', False)
-        super().__init__(training_config, criterion, dt)
+        super().__init__(training_config, criterion)
 
     def get_act_lens_motor_omegas(self, extra_state_jsons, times):
         act_cables = self.simulator.robot.actuated_cables.values()
@@ -1491,11 +1490,9 @@ class TensegrityMultiSimGNNTrainingEngine(TensegrityGNNTrainingEngine):
 
     def __init__(self,
                  training_config: Dict,
-                 criterion: _Loss,
-                 dt: Union[float, torch.Tensor],
                  logger: logging.Logger):
         self.num_sims = training_config.get('num_sims', 10)
-        super().__init__(training_config, criterion, dt, logger)
+        super().__init__(training_config, logger)
         print('use_gt_act_lens', self.use_gt_act_lens)
 
     def _get_dataset(self, data_dict):
@@ -1996,16 +1993,96 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMultiS
 
     def __init__(self,
                  training_config: Dict,
-                 criterion: _Loss,
-                 dt: Union[float, torch.Tensor],
                  logger: logging.Logger):
-        self.num_ctrls_hist = training_config.get('num_ctrls_hist', 1)
+        super(TensegrityGNNTrainingEngine, self).__init__()
+        self.sim_config = training_config['sim_config']
+        if isinstance(training_config['sim_config'], str):
+            with open(training_config['sim_config'], "r") as j:
+                self.sim_config = json.load(j)
+
         self.use_gt_cable_dl = training_config.get('use_gt_cable_dl', False)
-        super().__init__(training_config, criterion, dt, logger)
+        self.num_ctrls_hist = self.sim_config.get('num_ctrls_hist', 1)
+        self.num_sims = training_config.get('num_sims', 10)
+
+        self.dt = self.sim_config['dt']
+        self.dtype = DEFAULT_DTYPE
+        self.device = 'cpu'
+        self.config = training_config
+        # self.simulator = self.get_dummy_simulator()
+        self.num_steps_fwd = self.config.get('num_steps_fwd', 1)
+        self.num_hist = self.config.get('num_hist', 1)
+        self.save_rollout_vids = self.config.get('save_rollout_vids', False)
+        self.use_gt_act_lens = self.config.get('use_gt_act_lens', False)
+
+        self.batch_size_per_update = self.config.get('batch_size_per_update', 128)
+        self.batch_size_per_step = self.config.get('batch_size_per_step', 128)
+        self.sim_config['cache_batch_sizes'] = [1, self.batch_size_per_step]
+        assert self.batch_size_per_update % self.batch_size_per_step == 0
+        self.num_grad_accum = round(self.batch_size_per_update / self.batch_size_per_step)
+        self.curr_accum_step = 1
+
+        self.load_sim = self.config.get('load_sim', False)
+        self.load_sim_path = self.config.get('load_sim_path', None)
+
+        self.output_dir = self.config['output_path']
+        Path(self.output_dir).mkdir(exist_ok=True)
+
+        self.logger = logger
+
+        self.best_val_loss = 1e20
+        self.best_rollout_loss = 1e20
+        self.best_n_step_rollout_loss = 1e20
+        self.best_train_loss = 1e20
+        self.num_no_improve = 10
+        self.EVAL_STEPSIZE = training_config['eval_stepsize']
+        self.MAX_NO_IMPROVE = 10
+        self.PRINT_STEP = 100
+        self.epoch_num = 0
+        self.num_eval_n_steps = self.config.get('num_eval_n_steps', 200)
+
+        if self.config.get('save_code', True):
+            self.save_code()
+
+        self.data_root = training_config['data_root']
+        train_data_paths = [Path(self.data_root, p) for p in training_config['train_data_paths']]
+        val_data_paths = [Path(self.data_root, p) for p in training_config['val_data_paths']]
+
+        self.train_data_dict = self._init_data(train_data_paths)
+        self.train_dataset = self._get_dataset(self.train_data_dict)
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size_per_step,
+            shuffle=True,
+            collate_fn=self.train_dataset.collate_fn
+        )
+
+        self.val_data_dict = self._init_data(val_data_paths)
+        self.val_dataset = self._get_dataset(self.val_data_dict)
+        self.val_dataloader = DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size_per_step,
+            shuffle=True,
+            collate_fn=self.val_dataset.collate_fn
+        )
+
+        # delattr(self, "simulator")
+        self.simulator = self.get_simulator()
+
+        self.trainable_params = torch.nn.ParameterList(self.simulator.parameters())
+        self.optimizer = torch.optim.Adam(
+            self.parameters(),
+            **training_config['optimizer_params']
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            20,
+            1e-8
+        )
+        self.loss_fn = torch.nn.MSELoss()
 
     def get_act_lens_motor_omegas(self, extra_state_jsons, times):
-        act_cables = self.simulator.robot.actuated_cables.values()
-        _rest_lengths = [s._rest_length for s in act_cables]
+        _rest_lengths = [2.7] * 6
+        max_omega = 0.7 * 220 * 2 * np.pi / 60
 
         data_act_lens, data_motor_omegas = [], []
 
@@ -2034,14 +2111,14 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMultiS
             # sim.run_compile()
             print("Loaded simulator")
         else:
-            sim_config_cpy = deepcopy(self.sim_config)
-            sim_config_cpy.pop('gravity')
-            sim_config_cpy.pop('contact_params')
-
             sim = TensegrityGNNSimulator(
-                **sim_config_cpy,
-                num_sims=self.num_sims,
-                num_ctrls_hist=self.num_ctrls_hist
+                gnn_params=self.sim_config['gnn_params'],
+                tensegrity_cfg=self.sim_config['tensegrity_cfg'],
+                num_sims=self.sim_config['num_sims'],
+                num_ctrls_hist=self.sim_config['num_ctrls_hist'],
+                dt = self.sim_config['dt'],
+                cache_batch_sizes=[self.batch_size_per_step],
+                use_gt_act_lens=self.use_gt_act_lens
             )
 
         return sim

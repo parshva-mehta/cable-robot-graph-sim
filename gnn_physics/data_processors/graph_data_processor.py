@@ -186,7 +186,8 @@ class GraphDataProcessor(BaseStateObject):
                 'cable_damping': 1,
             }
             self.cable_edge_feat_dict['cable_rest_length'] = (
-                1 if cable_input_type == 'ctrls' else self.NUM_OUT_STEPS)
+                1 if cable_input_type == CableInputType.CTRLS else self.NUM_OUT_STEPS
+            )
 
             if cable_input_type == CableInputType.CTRLS:
                 self.cable_edge_feat_dict['cable_ctrls'] = num_ctrls_hist + num_out_steps

@@ -20,7 +20,7 @@ class SystemTopology(torch.nn.Module):
         """
         super().__init__()
         self.sites_dict = sites_dict if sites_dict else {}
-        self.topology = self._create_topology(rigid_bodies, cables)
+        self.topology = self._build_topology_map(rigid_bodies, cables)
 
     def to(self, device):
         if self.sites_dict:

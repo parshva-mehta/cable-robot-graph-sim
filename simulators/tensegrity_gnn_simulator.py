@@ -20,6 +20,7 @@ class TensegrityGNNSimulator(LearnedSimulator):
             dt=0.01,
             num_sims: int = 10,
             num_ctrls_hist: int = 20,
+            use_gt_act_lens: bool = False,
             cache_batch_sizes: List[int] | None = None
     ):
         self.use_cable_decoder = gnn_params['use_cable_decoder']
@@ -36,13 +37,14 @@ class TensegrityGNNSimulator(LearnedSimulator):
             'tensegrity': robot,
             'dt': dt,
             'cache_batch_sizes': cache_batch_sizes,
-            'recur_latent_dim': gnn_params['latent_dim'],
+            'node_hidden_state_size': gnn_params['latent_dim'],
             'num_out_steps': self.num_out_steps,
+            'num_ctrls_hist': self.num_ctrls_hist,
             'num_sims': num_sims
         }
 
-        if gnn_params['recurrent_type'] == RecurrentType.LSTM:
-            data_processor_params['recur_latent_dim'] *= 2
+        if gnn_params['recurrent_type'] == RecurrentType.LSTM.value:
+            data_processor_params['node_hidden_state_size'] *= 2
 
         super().__init__(
             gnn_params,
@@ -55,6 +57,9 @@ class TensegrityGNNSimulator(LearnedSimulator):
         torch._dynamo.config.cache_size_limit = 512
         self.data_processor.compile(fullgraph=True)
         self._encode_process_decode.compile(fullgraph=True)
+
+    def update_state(self, next_state: torch.Tensor) -> None:
+        self.robot.update_state(next_state)
 
     def reset(self, **kwargs):
         if 'act_lens' in kwargs:
