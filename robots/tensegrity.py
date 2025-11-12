@@ -1,18 +1,17 @@
 from collections import OrderedDict
-from typing import Dict, Union, Tuple, overload
+from typing import Dict, Union, Tuple, List
 
 import torch
 
-from state_objects.base_state_object import BaseStateObject
+from robots.cable_driven_robot import CableDrivenRobot
 from state_objects.cables import get_cable, ActuatedCable, Cable
 from state_objects.system_topology import SystemTopology
-from state_objects.tensegrity_rods import *
+from state_objects.tensegrity_rods import TensegrityRod, TensegrityHousingRod
 from state_objects.primitive_shapes import Cylinder
 from utilities import torch_quaternion
-from utilities.tensor_utils import zeros
 
 
-class TensegrityRobot(BaseStateObject):
+class TensegrityRobot(CableDrivenRobot):
     system_topology: SystemTopology
     rods: Dict[str, TensegrityRod]
     cables: Dict[str, Cable]
@@ -35,66 +34,10 @@ class TensegrityRobot(BaseStateObject):
 
         @param cfg: config dict
         """
-        super().__init__(cfg['name'])
-        topology_dict = cfg['system_topology']
-        self.system_topology = SystemTopology.init_to_torch(
-            topology_dict['sites'],
-            topology_dict['topology'],
-        )
-        self.rods = self._init_rods(cfg)
-        self.cables = self._init_cables(cfg)
+        rods = self._init_rods(cfg)
+        cables = self._init_cables(cfg)
 
-        self.num_rods = len(self.rods)
-
-        # Concat of state vars
-        self.pos = torch.hstack([rod.pos for rod in self.rods.values()])
-        self.linear_vel = torch.hstack([rod.linear_vel for rod in self.rods.values()])
-        self.quat = torch.hstack([rod.quat for rod in self.rods.values()])
-        self.ang_vel = torch.hstack([rod.ang_vel for rod in self.rods.values()])
-
-        # Split cables to actuated and non-actuated
-        self.actuated_cables, self.non_actuated_cables = {}, {}
-        for k, cable in self.cables.items():
-            if isinstance(cable, ActuatedCable):
-                self.actuated_cables[k] = cable
-            else:
-                self.non_actuated_cables[k] = cable
-
-        # Pre-computed cable consts used to compute forces
-        self.k_mat, self.c_mat, self.cable2rod_idxs, self.rod_end_pts \
-            = self.build_cable_consts()
-
-        self._init_sites()
-        self.cable_map = cfg['act_cable_mapping'] \
-            if 'act_cable_mapping' in cfg \
-            else {s.name: s.name for s in self.actuated_cables.values()}
-
-    @property
-    def rigid_bodies(self):
-        return self.rods
-
-    def _init_sites(self):
-        """
-        Initialize rod sites from system topology
-        """
-        for rod in self.rods.values():
-            for site in rod.sites:
-                world_frame_pos = self.system_topology.sites_dict[site].reshape(-1, 3, 1)
-                body_frame_pos = rod.world_to_body_coords(world_frame_pos)
-                rod.update_sites(site, body_frame_pos)
-
-    def to(self, device: Union[str, torch.device]):
-        self.system_topology.to(device)
-        for k, rod in self.rods.items():
-            rod.to(device)
-
-        for k, cable in self.cables.items():
-            cable.to(device)
-
-        self.k_mat = self.k_mat.to(device)
-        self.c_mat = self.c_mat.to(device)
-
-        return self
+        super().__init__(rods, cables)
 
     @property
     def sphere_radius(self):
@@ -102,46 +45,7 @@ class TensegrityRobot(BaseStateObject):
 
     @property
     def rod_length(self):
-        return list(self.rods.values())[0].length
-
-    def update_state(self, next_state):
-        batch_size = next_state.shape[0]
-        next_state_ = next_state.reshape(-1, 13, 1)
-        
-        self.pos = next_state_[:, :3].reshape(batch_size, -1, 1)
-        self.quat = next_state_[:, 3:7].reshape(batch_size, -1, 1)
-        self.linear_vel = next_state_[:, 7:10].reshape(batch_size, -1, 1)
-        self.ang_vel = next_state_[:, 10:].reshape(batch_size, -1, 1)
-
-        # Update each rod
-        for i, rod in enumerate(self.rods.values()):
-            rod.update_state(
-                self.pos[:, i * 3: (i + 1) * 3],
-                self.linear_vel[:, i * 3: (i + 1) * 3],
-                self.quat[:, i * 4: (i + 1) * 4],
-                self.ang_vel[:, i * 3: (i + 1) * 3],
-            )
-
-        self.update_system_topology()
-
-    def update_system_topology(self):
-        """
-        Update site positions in sys topology object after updating rod states
-        """
-        for rod in self.rods.values():
-            for site, rel_pos in rod.sites.items():
-                world_pos = rod.body_to_world_coords(rel_pos)
-                self.system_topology.update_site(site, world_pos)
-
-    def get_curr_state(self):
-        state = torch.hstack([
-            self.pos.reshape(-1, 3, 1),
-            self.quat.reshape(-1, 4, 1),
-            self.linear_vel.reshape(-1, 3, 1),
-            self.ang_vel.reshape(-1, 3, 1),
-        ]).reshape(-1, 13 * len(self.rods), 1)
-
-        return state
+        return list(self.rigid_bodies.values())[0].length
 
     def _init_rods(self, config: dict) -> Dict[str, TensegrityRod]:
         """
@@ -175,81 +79,6 @@ class TensegrityRobot(BaseStateObject):
 
         return cables
 
-    def _find_rod_idxs(self, cable: Cable) -> Tuple[int, int]:
-        end_pt0, end_pt1 = cable.end_pts
-        rod_idx0, rod_idx1 = None, None
-
-        for i, rod in enumerate(self.rods.values()):
-            if end_pt0 in rod.sites:
-                rod_idx0 = i
-            elif end_pt1 in rod.sites:
-                rod_idx1 = i
-
-        return rod_idx0, rod_idx1
-
-    def build_cable_consts(self) \
-            -> Tuple[torch.Tensor, torch.Tensor, Tuple[list, list], dict]:
-        """
-        Precompute constants used to compute cable forces and torques analytically
-        @return:
-        """
-        k_mat = torch.zeros((1, len(self.rods), len(self.cables)),
-                            dtype=self.dtype)
-        c_mat = torch.zeros((1, len(self.rods), len(self.cables)),
-                            dtype=self.dtype)
-
-        end_pt0_idxs, end_pt1_idxs = [], []
-        rod_end_pts = [[None] * len(self.cables) for _ in range(len(self.rods))]
-        for j, cable in enumerate(self.cables.values()):
-            k = cable.stiffness
-            c = cable.damping
-
-            rod_idx0, rod_idx1 = self._find_rod_idxs(cable)
-            end_pt0_idxs.append(rod_idx0)
-            end_pt1_idxs.append(rod_idx1)
-            rod_end_pts[rod_idx0][j] = cable.end_pts[0]
-            rod_end_pts[rod_idx1][j] = cable.end_pts[1]
-
-            m, n = (rod_idx0, rod_idx1) if rod_idx1 > rod_idx0 \
-                else (rod_idx1, rod_idx0)
-
-            k_mat[0, m, j] = k
-            k_mat[0, n, j] = -k
-
-            c_mat[0, m, j] = c
-            c_mat[0, n, j] = -c
-
-        return k_mat, c_mat, (end_pt0_idxs, end_pt1_idxs), rod_end_pts
-
-    def get_rest_lengths(self):
-        batch_size = self.pos.shape[0]
-        rest_lengths = []
-        for s in self.cables.values():
-            rest_length = s.rest_length
-            if rest_length.shape[0] == 1:
-                rest_length = rest_length.repeat(batch_size, 1, 1)
-            rest_lengths.append(rest_length)
-        return torch.concat(rest_lengths, dim=2)
-
-    def get_cable_acting_pts(self):
-        ref_tensor = None
-        for s in self.rod_end_pts[0]:
-            if s:
-                ref_tensor = self.system_topology.sites_dict[s]
-                break
-
-        act_pts = torch.hstack([
-            torch.concat(
-                [self.system_topology.sites_dict[s]
-                 if s else zeros(ref_tensor.shape, ref_tensor=ref_tensor)
-                 for s in cable],
-                dim=2
-            )
-            for cable in self.rod_end_pts
-        ])
-
-        return act_pts
-
     def compute_end_pts(self, state):
         end_pts = []
         length = self.rod_length
@@ -259,69 +88,6 @@ class TensegrityRobot(BaseStateObject):
             end_pts.extend(Cylinder.compute_end_pts_from_state(state_, principal_axis, length))
 
         return torch.concat(end_pts, dim=2)
-
-    def compute_cable_forces(self):
-        endpt_idxs0, endpt_idxs1 = self.cable2rod_idxs
-        rods = list(self.rods.values())
-        cables = list(self.cables.values())
-
-        rod_pos = torch.concat([rod.pos for rod in rods], dim=2)
-        rod_linvel = torch.concat([rod.linear_vel for rod in rods], dim=2)
-        rod_angvel = torch.concat([rod.ang_vel for rod in rods], dim=2)
-
-        cable_end_pts0 = torch.concat([self.system_topology.sites_dict[s.end_pts[0]]
-                                       for s in cables], dim=2)
-        cable_end_pts1 = torch.concat([self.system_topology.sites_dict[s.end_pts[1]]
-                                       for s in cables], dim=2)
-        cable_vecs = cable_end_pts1 - cable_end_pts0
-        cable_lengths = cable_vecs.norm(dim=1, keepdim=True)
-        cable_unit_vecs = cable_vecs / cable_lengths
-
-        length_diffs = cable_lengths - self.get_rest_lengths()
-        length_diffs = (torch.clamp_min(length_diffs, 0.0)
-                        .repeat(1, len(rods), 1))
-
-        vels0 = (
-                rod_linvel[..., endpt_idxs0]
-                + torch.cross(rod_angvel[..., endpt_idxs0],
-                              cable_end_pts0 - rod_pos[..., endpt_idxs0],
-                              dim=1)
-        )
-        vels1 = (
-                rod_linvel[..., endpt_idxs1]
-                + torch.cross(rod_angvel[..., endpt_idxs1],
-                              cable_end_pts1 - rod_pos[..., endpt_idxs1],
-                              dim=1)
-        )
-        rel_vels = torch.linalg.vecdot(
-            vels1 - vels0,
-            cable_unit_vecs,
-            dim=1
-        ).unsqueeze(1).repeat(1, len(rods), 1)
-
-        stiffness_force_mags = self.k_mat * length_diffs
-        damping_force_mags = self.c_mat * rel_vels
-        force_mags = stiffness_force_mags + damping_force_mags
-
-        rod_forces = torch.hstack([
-            force_mags[:, i: i + 1] * cable_unit_vecs
-            for i in range(len(rods))
-        ])
-        act_pts = self.get_cable_acting_pts()
-
-        net_rod_forces = rod_forces.sum(dim=2, keepdim=True)
-
-        return net_rod_forces, rod_forces, act_pts
-
-    def compute_cable_length(self, cable: Cable):
-        end_pt0 = self.system_topology.sites_dict[cable.end_pts[0]]
-        end_pt1 = self.system_topology.sites_dict[cable.end_pts[1]]
-
-        x_dir = end_pt1 - end_pt0
-        length = x_dir.norm(dim=1, keepdim=True)
-        x_dir = x_dir / length
-
-        return length, x_dir
 
 
 class TensegrityRobotGNN(TensegrityRobot):
@@ -351,7 +117,6 @@ class TensegrityRobotGNN(TensegrityRobot):
         self._cable_stiffness = None
         self._cable_rest_length = None
 
-        self._cable_template = None
 
         self.node_mapping = {
             body.name: i * len(rod.rigid_bodies) + j
@@ -359,6 +124,7 @@ class TensegrityRobotGNN(TensegrityRobot):
             for j, body in enumerate(rod.rigid_bodies.values())
         }
 
+        self._cable_template = None
         self.template = self.get_template_graph()
         self.template_idx = self.convert_to_idx_edges(self.template)
 
@@ -384,24 +150,6 @@ class TensegrityRobotGNN(TensegrityRobot):
             self._inv_inertia = self._inv_inertia.to(device)
 
         return self
-
-    def update_by_graph(self, graph):
-        pos = graph.pos
-        num_nodes = self.num_nodes + 1
-
-        for k, rod in self.rods.items():
-            end_pt_0_idx = rod.sphere0_idx
-            end_pt_1_idx = rod.sphere0_idx
-
-            end_pt0 = pos[end_pt_0_idx::num_nodes].unsqueeze(-1)
-            end_pt1 = pos[end_pt_1_idx::num_nodes].unsqueeze(-1)
-
-            dummy_vel = zeros(end_pt0.shape, ref_tensor=pos)
-            rod.update_state_by_endpts(
-                [end_pt0, end_pt1],
-                dummy_vel,
-                dummy_vel.clone()
-            )
 
     def update_state(self, next_state, update_sys_top=False):
         batch_size = next_state.shape[0]
@@ -474,6 +222,7 @@ class TensegrityRobotGNN(TensegrityRobot):
                     for cable in self.cables.values()
                     for i in range(2)
                 ], dtype=torch.int).T
+
         return self._cable_template
 
     @property

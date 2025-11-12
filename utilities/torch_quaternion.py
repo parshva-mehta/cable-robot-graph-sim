@@ -395,66 +395,6 @@ def rot_mat_to_quat(rot_mat):
 
     quat = quat / quat.norm(dim=1, keepdim=True)
 
-    """
-    if (m22 < 0){
-         if (m00 > m11){
-             t = 1 + m00 - m11 - m22;
-             q = quat( t, m01+m10, m20+m02, m12-m21 );
-         }
-         else {
-             t = 1 - m00 + m11 - m22;
-             q = quat( m01+m10, t, m12+m21, m20-m02 );
-         }
-    } else {
-         if (m00 < -m11) {
-             t = 1 - m00 - m11 + m22;
-             q = quat( m20+m02, m12+m21, t, m01-m10 );
-         }
-         else {
-             t = 1 + m00 + m11 + m22;
-             q = quat( m12-m21, m20-m02, m01-m10, t );
-         }
-     }
-     q *= 0.5 / Sqrt(t);
-    """
-    #
-    # r00, r01, r02 = rot_mat[:, 0:1, 0], rot_mat[:, 0:1, 1], rot_mat[:, 0:1, 2]
-    # r10, r11, r12 = rot_mat[:, 1:2, 0], rot_mat[:, 1:2, 1], rot_mat[:, 1:2, 2]
-    # r20, r21, r22 = rot_mat[:, 2:3, 0], rot_mat[:, 2:3, 1], rot_mat[:, 2:3, 2]
-
-    # pre_cond0 = r22 < 0.0
-    # pre_cond1 = r00 > r11
-    # pre_cond2 = r00 < -r11
-    #
-    # cond1 = torch.logical_and(pre_cond0, pre_cond1)
-    # cond2 = torch.logical_and(pre_cond0, ~pre_cond1)
-    # cond3 = torch.logical_and(~pre_cond0, pre_cond2)
-    # cond4 = torch.logical_and(~pre_cond0, ~pre_cond2)
-    #
-    # t1 = 1.0 + r00 - r11 - r22
-    # t2 = 1.0 - r00 + r11 - r22
-    # t3 = 1.0 - r00 - r11 + r22
-    # t4 = 1.0 + r00 + r11 + r22
-    #
-    # t = cond1 * t1 + cond2 * t2 + cond3 * t3 + cond4 * t4
-    #
-    # q1 = torch.hstack([t, r01 + r10, r20 + r02, r12 - r21])
-    # q2 = torch.hstack([r01 + r10, t, r12 + r21, r20 - r02])
-    # q3 = torch.hstack([r20 + r02, r12 + r21, t, r01 - r10])
-    # q4 = torch.hstack([r12 - r21, r20 - r02, r01 - r10, t])
-    #
-    # q = cond1 * q1 + cond2 * q2 + cond3 * q3 + cond4 * q4
-    # q *= 0.5 / (t ** 0.5)
-
-    # qx = 0.25 * (rot_mat[:, 2, 1] - rot_mat[:, 1, 2]) / (qw + 1e-8)
-    # qy = 0.25 * (rot_mat[:, 0, 2] - rot_mat[:, 2, 0]) / (qw + 1e-8)
-    # qz = 0.25 * (rot_mat[:, 1, 0] - rot_mat[:, 0, 1]) / (qw + 1e-8)
-
-    # q = torch.hstack([
-    #     qw,
-    #     torch.sign(r21 - r12) * 0.5 * torch.abs(())
-    # ])
-
     return quat
 
 
@@ -572,16 +512,3 @@ def compute_quat_btwn_z_and_vec(prin_axis):
 
 def compute_prin_axis(quat):
     return quat_as_rot_mat(quat)[..., 2:3]
-
-
-if __name__ == '__main__':
-    pt = torch.tensor([4, 3, 2], dtype=torch.float64).reshape(1, 3, 1)
-    pos = torch.tensor([2, 1, 0], dtype=torch.float64).reshape(1, 3, 1)
-    q = torch.tensor([0.532, -0.5216, -0.999, 0.1455], dtype=torch.float64).reshape(1, 4, 1)
-    q /= q.norm(dim=1, keepdim=True)
-
-    rot_pt1 = rotate_vec_quat(q, pt)
-    rot_pt2 = rotate_vec_quat(q, pt - pos) + rotate_vec_quat(q, pos)
-    jjj=0
-
-

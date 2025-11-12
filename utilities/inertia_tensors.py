@@ -112,17 +112,3 @@ def body_to_world(rot_mat: torch.Tensor, body_inertia_tensor: torch.Tensor) -> t
     )
 
     return world_inertia
-
-
-def inertia_inv(rot_mat, body_inertia_tensor):
-    """
-    Method to invert world inertia tensor with numpy
-    I_world^-1 = R * I_body^-1 * R^T
-    :param rot_mat: rotation matrix
-    :param body_inertia_tensor: body frame inertia np array
-    :return: Inverse world frame inertia tensor as np array
-    """
-    body_inertia_tensor_inv = np.linalg.inv(body_inertia_tensor)
-    world_inertia_inv = body_to_world(rot_mat, body_inertia_tensor_inv)
-
-    return world_inertia_inv

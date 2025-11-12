@@ -22,18 +22,12 @@ class RigidBody(BaseStateObject):
 
         self.mass = mass
         self.I_body = I_body
-
-        if mass == 0.0:
-            self.I_body_inv = self.I_body.clone()
-        else:
-            self.I_body_inv = torch.linalg.inv(I_body)
+        self.I_body_inv = self.I_body.clone() if mass == 0.0 else torch.linalg.inv(I_body)
 
         self.pos = pos
-
+        self.quat = quat
         self.linear_vel = linear_vel
         self.ang_vel = ang_vel
-
-        self.quat = quat
 
         self.sites = {s: None for s in sites}
 
@@ -61,16 +55,6 @@ class RigidBody(BaseStateObject):
 
     def body_to_world_coords(self, body_coords):
         return (self.rot_mat @ body_coords) + self.pos
-
-    def detach_state(self):
-        self.pos = self.pos.detach()
-        self.linear_vel = self.linear_vel.detach()
-        self.ang_vel = self.ang_vel.detach()
-        self.quat = self.quat.detach()
-
-        # self.rot_mat = self.rot_mat.detach()
-
-        return self
 
     def update_state(self, pos, linear_vel, quat, ang_vel):
         self.pos = pos

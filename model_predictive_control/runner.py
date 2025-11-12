@@ -260,7 +260,7 @@ class MPPIRunner:
 
         while not reached_goal and step < self.max_steps:
             actions, states, batch_states = self.plan(step)
-            num_rods = self.planner.sim.num_rods
+            num_rods = self.planner.sim.num_bodies
 
             batch_pos = sum([batch_states[:, i * 13: (i + 1) * 13] for i in range(num_rods)]) / num_rods
             sim_poses = [

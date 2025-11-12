@@ -13,45 +13,18 @@
   "data_root": "../data_sets/tensegrity_real_datasets/",
   "train_data_paths": [
     "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_ccw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_ccw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_cw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_cw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_roll_2",
     "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_roll_3",
     "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_ccw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_ccw_2",
     "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_cw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_cw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_roll_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_roll_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_ccw_1",
     "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_ccw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_cw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_cw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_ccw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_ccw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_cw_1",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_cw_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_roll_2",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_roll_3"
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_3"
   ],
   "val_data_paths": [
     "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_ccw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_cw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_roll_4",
-    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_ccw_3",
     "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_cw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_roll_4",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_ccw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_cw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_4",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_ccw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_cw_3",
-    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_roll_4"
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_4"
   ],
   "load_sim": false,
-  "load_sim_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/l4dc/r2s_3bar/e2e_gnn_v1/best_rollout_model.pt",
-  "output_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/l4dc/model_comp_ablation/"
+  "load_sim_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp/best_rollout_model.pt",
+  "output_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp/"
 }

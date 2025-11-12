@@ -23,12 +23,11 @@ def train():
 
     idxs = set()
     for i in range(5):
-        config_file['output_path'] = out + f'full_gnn_recurrent/full_gnn_v{i}/'
         config_file['load_sim_path'] = config_file['output_path'] + 'best_rollout_model.pt'
 
         Path(config_file['output_path']).parent.mkdir(parents=True, exist_ok=True)
 
-        config_file['val_data_paths'] = []
+        # config_file['val_data_paths'] = []
         #     f"dataset_{i}/mjc_mppi_run_47",
         #     f"dataset_{i}/mjc_mppi_run_31",
         #     f"dataset_{i}/mjc_mppi_run_39",
@@ -37,7 +36,7 @@ def train():
         #     f"dataset_{i}/random_ctrls_v2",
         # ]
         #
-        config_file['train_data_paths'] = []
+        # config_file['train_data_paths'] = []
         #     f"dataset_{i}/mjc_mppi_run_4",
         #     f"dataset_{i}/mjc_mppi_run_9",
         #     f"dataset_{i}/mjc_mppi_run_15",
@@ -52,28 +51,28 @@ def train():
         #     f"dataset_{i}/random_ctrls_v2",
         # ]
 
-        datasets = np.random.choice([k for k in range(9) if k not in idxs], 1, replace=False).tolist()
-        for d in datasets:
-            config_file['train_data_paths'].extend([
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_ccw_1",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_ccw_2",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_cw_1",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_cw_2",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_roll_2",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_roll_3",
-            ])
-            config_file['val_data_paths'].extend([
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_ccw_3",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_cw_3",
-                f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_roll_4",
-            ])
+        # datasets = np.random.choice([k for k in range(9) if k not in idxs], 1, replace=False).tolist()
+        # for d in datasets:
+        #     config_file['train_data_paths'].extend([
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_ccw_1",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_ccw_2",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_cw_1",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_cw_2",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_roll_2",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_roll_3",
+        #     ])
+        #     config_file['val_data_paths'].extend([
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_ccw_3",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_cw_3",
+        #         f"mjc_6d_new_platform_real_dl_v1/dataset_{d}/mjc_roll_4",
+        #     ])
 
         Path(config_file['output_path']).mkdir(parents=True, exist_ok=True)
 
         logger = setup_logger(config_file['output_path'])
         save_code = True
-        idxs.add(datasets[0])
-        logger.info(f"Eval on dataset {datasets[0]}")
+        # idxs.add(datasets[0])
+        # logger.info(f"Eval on dataset {datasets[0]}")
 
         num_steps = [4, 4, 8, 8, 16]
         epochs = [100, 50, 120, 60, 30, 30, 15]
@@ -98,7 +97,7 @@ def train():
                 config_file, torch.nn.MSELoss(), 0.01, logger
             )
 
-            trainer.to('cuda:0')
+            # trainer.to('cuda:0')
             trainer.run(e)
 
             output_dir = Path(config_file['output_path'])

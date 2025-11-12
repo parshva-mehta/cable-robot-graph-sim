@@ -44,20 +44,12 @@ class LearnedSimulator(AbstractSimulator):
 
     def __init__(
             self,
-            n_out: int,
-            latent_dim: int,
-            nmessage_passing_steps: int,
-            nmlp_layers: int,
-            mlp_hidden_dim: int,
-            data_processor_kwargs: Dict,
-            additional_gnn_kwargs: Dict | None = None,
-            processor_shared_weights=False,
+            gnn_params: Dict,
+            data_processor_params: Dict,
     ):
-        if additional_gnn_kwargs is None:
-            additional_gnn_kwargs = {}
 
         super().__init__()
-        self.data_processor_kwargs = data_processor_kwargs
+        self.data_processor_params = data_processor_params
         self.data_processor = self._get_data_processor()
 
         self.node_types = {k: sum(v.values()) for k, v in self.data_processor.hier_node_feat_dict.items()}
@@ -68,13 +60,7 @@ class LearnedSimulator(AbstractSimulator):
         self._encode_process_decode = self._build_gnn(
             node_types=self.node_types,
             edge_types=self.edge_types,
-            n_out=n_out,
-            latent_dim=latent_dim,
-            nmessage_passing_steps=nmessage_passing_steps,
-            nmlp_layers=nmlp_layers,
-            mlp_hidden_dim=mlp_hidden_dim,
-            processor_shared_weights=processor_shared_weights,
-            **additional_gnn_kwargs
+            **gnn_params,
         )
 
     def reset(self, **kwargs):

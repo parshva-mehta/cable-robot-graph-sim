@@ -357,7 +357,7 @@ class RealTensegrity5DGNNTrainingEngine(TensegrityMultiSimGNNTrainingEngine):
             return start_state
 
     def _shift_robot(self, curr_end_pts, shift_end_pts):
-        n = len(self.simulator.robot.rods)
+        n = len(self.simulator.robot.rigid_bodies)
 
         curr_end_pts_ = curr_end_pts.reshape(-1, 3, 1)
         shift_end_pts_ = shift_end_pts.reshape(-1, 3, 1)
@@ -394,7 +394,7 @@ class RealTensegrity5DGNNTrainingEngine(TensegrityMultiSimGNNTrainingEngine):
         return None
 
     def pos_quat_to_states(self, data_pos, data_quats, times, data_vels, data_names=None):
-        num_rods = len(self.simulator.robot.rods)
+        num_rods = len(self.simulator.robot.rigid_bodies)
 
         data_states = []
         for k, (pos, quats, times) in enumerate(zip(data_pos, data_quats, times)):

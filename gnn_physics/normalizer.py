@@ -49,7 +49,6 @@ class AccumulatedNormalizer(BaseStateObject):
         @return:
         """
         if self.accum_flag and not no_accum:
-
             data_acc_sum = batched_data.detach().sum(dim=0, keepdim=True)
             data_acc_sum_squared = (batched_data.detach() ** 2).sum(dim=0, keepdim=True)
             num_data = batched_data.shape[0]

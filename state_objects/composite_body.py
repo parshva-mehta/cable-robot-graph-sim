@@ -75,11 +75,6 @@ class CompositeBody(RigidBody):
         super().update_state(pos, linear_vel, rot_val, ang_vel)
         self.inner_bodies_updated = False
 
-    def detach_state(self):
-        super().detach_state()
-        for b in self.rigid_bodies.values():
-            b.detach_state()
-
     def init_rigid_bodies_dict(self, rigid_bodies):
         rigid_body_dict = OrderedDict()
         for body in rigid_bodies:

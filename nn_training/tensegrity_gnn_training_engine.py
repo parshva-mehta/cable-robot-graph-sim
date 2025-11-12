@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -12,12 +13,9 @@ from torch.nn.modules.loss import _Loss
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data as Graph
 
-from mujoco_visualizer_utils.mujoco_visualizer import MuJoCoVisualizer
 from nn_training.datasets.tensegrity_dataset import TensegrityDataset, TensegrityMultiSimMotorDataset, \
     TensegrityMultiSimDataset
 from simulators.tensegrity_gnn_simulator import *
-from simulators.tensegrity_physics_gnn_simulator import TensegrityHybridGNNSimulator
-from simulators.tensegrity_physics_simulator import Tensegrity5dRobotSimulator, TensegrityRobotSimulator
 from state_objects.primitive_shapes import Cylinder
 from utilities import torch_quaternion
 from utilities.misc_utils import save_curr_code, DEFAULT_DTYPE
@@ -290,7 +288,7 @@ class TensegrityGNNTrainingEngine(nn.Module):
         return data_pos, data_quats, data_controls
 
     def pos_quat_to_states(self, data_pos, data_quats, times, data_vels):
-        num_rods = len(self.simulator.robot.rods)
+        num_rods = len(self.simulator.robot.rigid_bodies)
 
         data_states = []
         for k, (pos, quats, times) in enumerate(zip(data_pos, data_quats, times)):
@@ -676,7 +674,7 @@ class TensegrityGNNTrainingEngine(nn.Module):
         return total_loss, total_com_loss, total_angle_loss
 
     def rotate_data_aug(self, batch_x, gt_end_pts):
-        n = len(self.simulator.robot.rods)
+        n = len(self.simulator.robot.rigid_bodies)
 
         angle = 2 * torch.pi * (torch.rand((batch_x.shape[0], 1, 1), device=batch_x.device) - 0.5)
         w = torch.cos(angle / 2)
@@ -935,246 +933,6 @@ class TensegrityGNNTrainingEngine(nn.Module):
             self.curr_accum_step = 1
         else:
             self.curr_accum_step += 1
-
-
-class TensegrityPhysicsTrainingEngine(TensegrityGNNTrainingEngine):
-
-    def __init__(self,
-                 training_config: Dict,
-                 criterion: _Loss,
-                 dt: Union[float, torch.Tensor],
-                 logger: logging.Logger):
-        super().__init__(training_config,
-                         criterion,
-                         dt,
-                         logger)
-        self.end_pts_acc_mean, self.end_pts_acc_var = (
-            self.compute_end_pts_acc_std(self.train_data_dict['gt_end_pts']))
-
-    def to(self, device):
-        super().to(device)
-        self.end_pts_acc_mean = self.end_pts_acc_mean.to(device)
-        self.end_pts_acc_var = self.end_pts_acc_var.to(device)
-
-        return self
-
-    def compute_end_pts_acc_std(self, all_gt_end_pts):
-        gt_end_pts_acc = []
-        for gt_end_pts in all_gt_end_pts:
-            gt_end_pts = [gt_end_pts[0]] * 2 + gt_end_pts
-            gt_end_pts = torch.vstack([torch.hstack(e) for e in gt_end_pts])
-
-            acc = (gt_end_pts[2:] - 2 * gt_end_pts[1:-1] + gt_end_pts[:-2]) / (self.dt ** 1)
-            gt_end_pts_acc.append(acc)
-
-        gt_end_pts_acc = torch.vstack(gt_end_pts_acc)
-
-        mu = gt_end_pts_acc.mean(dim=0, keepdim=True)
-        std = gt_end_pts_acc.std(dim=0, keepdim=True)
-        std_safe = torch.clamp_min(std, 1e-3)
-
-        return mu, std_safe
-
-    def get_simulator(self):
-        if self.load_sim and self.load_sim_path:
-            sim = torch.load(self.load_sim_path, map_location="cpu", weights_only=False)
-            sim.reset()
-            sim.cpu()
-            self.logger.info("Loaded simulator")
-        else:
-            sim = Tensegrity5dRobotSimulator(
-                self.sim_config['tensegrity_cfg'],
-                self.sim_config['gravity'],
-                self.sim_config['contact_params'],
-                learn_contact_params=True
-            )
-
-        return sim
-
-    def compute_init_losses(self):
-        train_loss = self.run_one_epoch(
-            self.train_dataloader,
-            grad_required=False,
-            rot_aug=True
-        )
-
-        val_loss = self.run_one_epoch(
-            self.val_dataloader,
-            grad_required=False
-        )
-
-        if True:
-        # if self.load_sim:
-            # train_rollout_loss = self.evaluate_rollouts(
-            #     self.train_data_dict
-            # )
-            # self.logger.info("Avg rollout loss:", train_rollout_loss)
-            self.simulator.eval()
-            val_rollout_loss = self.evaluate_rollouts(
-                self.val_data_dict
-            )
-            self.simulator.train()
-            self.logger.info(val_rollout_loss)
-
-        losses = (
-            train_loss,
-            val_loss,
-        )
-
-        return losses
-
-    def batch_sim_ctrls(self, batch) -> List[Graph]:
-        batch_state = batch['x']
-        controls = batch['ctrl']
-        act_lens = batch['act_len']
-        next_act_lens = batch['next_act_lens']
-        motor_omegas = batch['motor_omega']
-
-        self.simulator.reset(
-            act_lens=act_lens[..., -1:].clone(),
-            motor_speeds=motor_omegas[..., -1:].clone()
-        )
-
-        curr_state = batch_state[..., -1:].clone()
-
-        if self.use_gt_act_lens:
-            gt_act_lens, ctrls = [], None
-            for i in range(self.num_steps_fwd):
-                gt_act_lens.append(next_act_lens[:, :, i: i + 1].clone())
-                ctrls = None
-            gt_act_lens = torch.cat(gt_act_lens, dim=-1)
-        else:
-            gt_act_lens, ctrls = None, controls.clone()
-
-        states, graphs = self.simulator.run(
-            curr_state=curr_state,
-            dt=self.dt,
-            ctrls=ctrls,
-            gt_act_lens=gt_act_lens,
-        )
-
-        return states
-
-    def compute_node_loss(self, states, gt_endpts, dt):
-        pred_end_pts = torch.cat([
-            self._batch_compute_end_pts(s)
-            for s in states
-        ], dim=2)
-        loss = self.loss_fn(
-            pred_end_pts / (dt ** 1) / self.end_pts_acc_var,
-            gt_endpts / (dt ** 1) / self.end_pts_acc_var
-        )
-
-        end_pts_loss = self.loss_fn(pred_end_pts, gt_endpts).detach().item()
-        return loss, end_pts_loss
-
-    def backward(self, loss: torch.Tensor) -> None:
-        (loss / self.num_grad_accum).backward()
-
-        if self.curr_accum_step >= self.num_grad_accum:
-            self.optimizer.step()
-            # torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100)
-            self.optimizer.zero_grad()
-
-            if 'param_ranges' in self.config:
-                param_ranges = self.config['param_ranges']
-                for p_name, param in self.state_dict().items():
-                    if p_name in param_ranges:
-                        lower, upper = param_ranges[p_name]
-                        param.data.clamp_(lower, upper)
-
-            self.curr_accum_step = 1
-        else:
-            self.curr_accum_step += 1
-
-    def run_one_epoch(self,
-                      dataloader,
-                      grad_required=True,
-                      rot_aug=False) -> List[float]:
-        losses = super().run_one_epoch(dataloader, grad_required=grad_required, rot_aug=rot_aug)
-        print([(k.split('.')[-1], v.detach().item()) for k, v in self.state_dict().items() if 'contact' in k])
-        print(
-            f'restitution: {self.state_dict()["simulator.collision_resp_gen.contact_params.restitution"].detach().item()} '
-            f'baumgarte: {self.state_dict()["simulator.collision_resp_gen.contact_params.baumgarte"].detach().item()} '
-            f'friction: {self.state_dict()["simulator.collision_resp_gen.contact_params.friction"].detach().item()} '
-            f'friction_damping: {self.state_dict()["simulator.collision_resp_gen.contact_params.friction_damping"].detach().item()} '
-            f'rolling_friction: {self.state_dict()["simulator.collision_resp_gen.contact_params.rolling_friction"].detach().item()}')
-
-        contact_params = self.simulator.collision_resp_gen.contact_params
-        print(f'restitution: {contact_params.restitution.detach().item()} '
-              f'baumgarte: {contact_params.baumgarte.detach().item()} '
-              f'friction: {contact_params.friction.detach().item()} '
-              f'friction_damping: {contact_params.friction_damping.detach().item()} '
-              f'rolling_friction: {contact_params.rolling_friction.detach().item()}')
-
-        return losses
-
-    def eval_n_step_aheads(self, n, data_dict, num_samples=500):
-        trajs = data_dict['states']
-        act_lengths = data_dict['act_lengths']
-        motor_omegas = data_dict['motor_omegas']
-        all_controls = data_dict['controls']
-        all_gt_endpts = data_dict['gt_end_pts']
-
-        total_loss = 0.0
-        total_com_loss, total_angle_loss = 0.0, 0.0
-        for i in range(len(trajs)):
-            states = [trajs[i][0].clone() for _ in range(self.num_hist - 1)] + trajs[i]
-
-            idxs = list(range(len(states) - self.num_hist - n - 1))
-            random.shuffle(idxs)
-            idxs = idxs[:num_samples]
-
-            curr_states = torch.vstack(states[self.num_hist - 1:-n]).to(self.device)[idxs]
-            gt_act_lens, ctrls = self._get_n_step_act_lens_ctrls(act_lengths[i], all_controls[i], idxs, n)
-
-            last_states = []
-            for j, idx in enumerate(tqdm.tqdm(idxs)):
-                self.simulator.reset(
-                    act_lens=torch.vstack(act_lengths[i][:-n + 1])[idx: idx + 1].to(self.device),
-                    motor_speeds=torch.vstack(motor_omegas[i][:-n + 1])[idx: idx + 1].to(self.device)
-                )
-
-                curr_state = curr_states[j: j + 1]
-                if gt_act_lens is not None:
-                    gt_act_lens_, ctrls_ = gt_act_lens[j: j + 1], None
-                else:
-                    gt_act_lens_, ctrls_ = None, ctrls[j: j + 1]
-
-                states, _ = self.simulator.run(
-                    curr_state=curr_state,
-                    dt=self.dt,
-                    ctrls=ctrls_,
-                    num_steps=n,
-                    gt_act_lens=gt_act_lens_,
-                    show_progress=True
-                )
-
-                last_states.append(states[-1].clone())
-
-            last_states = torch.vstack(last_states)
-            pred_endpts = self._batch_compute_end_pts(last_states)
-            gt_endpts = torch.vstack([
-                torch.hstack(e)
-                for e in all_gt_endpts[i][n:]
-            ]).to(self.device)[idxs]
-
-            loss = self.loss_fn(pred_endpts, gt_endpts).detach().item()
-            total_loss += loss
-
-            com_loss, angle_loss = self.compute_com_and_rot_loss(pred_endpts, gt_endpts)
-            total_com_loss += com_loss
-            total_angle_loss += angle_loss
-
-            self.logger.info(f'{loss}, {com_loss}, {angle_loss}')
-
-        total_loss /= len(trajs) if len(trajs) > 0 else 1
-        total_com_loss /= len(trajs) if len(trajs) > 0 else 1
-        total_angle_loss /= len(trajs) if len(trajs) > 0 else 1
-
-        self.logger.info(f'Avg {n}-step: {total_loss}, {total_com_loss}, {total_angle_loss}')
-
-        return total_loss, total_com_loss, total_angle_loss
 
 
 class TensegrityRecurrentGNNTrainingEngine(TensegrityGNNTrainingEngine):
@@ -2280,11 +2038,10 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMultiS
             sim_config_cpy.pop('gravity')
             sim_config_cpy.pop('contact_params')
 
-            sim = MultiSimMultiStepMotorTensegrityGNNSimulator(
+            sim = TensegrityGNNSimulator(
                 **sim_config_cpy,
                 num_sims=self.num_sims,
-                num_ctrls_hist=self.num_ctrls_hist,
-                torch_compile=False
+                num_ctrls_hist=self.num_ctrls_hist
             )
 
         return sim

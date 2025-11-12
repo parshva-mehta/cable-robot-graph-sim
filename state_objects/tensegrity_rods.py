@@ -3,7 +3,7 @@ from typing import List, Optional
 import torch
 
 from state_objects.composite_body import CompositeBody
-from state_objects.primitive_shapes import Cylinder, SphereState, HollowCylinder
+from state_objects.primitive_shapes import Cylinder, Sphere, HollowCylinder
 from state_objects.rigid_object import RigidBody
 from utilities import torch_quaternion, inertia_tensors
 from utilities.tensor_utils import tensorify, zeros
@@ -211,24 +211,24 @@ class TensegrityRod(CompositeBody):
                       sphere_mass,
                       prin_axis,
                       quat):
-        endcap0 = SphereState(name + "_sphere0",
-                              end_pts[0],
-                              linear_vel.clone(),
-                              ang_vel.clone(),
-                              sphere_radius,
-                              sphere_mass,
-                              prin_axis,
-                              {},
-                              quat)
-        endcap1 = SphereState(name + "_sphere1",
-                              end_pts[1],
-                              linear_vel.clone(),
-                              ang_vel.clone(),
-                              sphere_radius,
-                              sphere_mass,
-                              prin_axis,
-                              {},
-                              quat)
+        endcap0 = Sphere(name + "_sphere0",
+                         end_pts[0],
+                         linear_vel.clone(),
+                         ang_vel.clone(),
+                         sphere_radius,
+                         sphere_mass,
+                         prin_axis,
+                         {},
+                         quat)
+        endcap1 = Sphere(name + "_sphere1",
+                         end_pts[1],
+                         linear_vel.clone(),
+                         ang_vel.clone(),
+                         sphere_radius,
+                         sphere_mass,
+                         prin_axis,
+                         {},
+                         quat)
 
         return [endcap0, endcap1]
 
@@ -382,105 +382,12 @@ class TensegrityRod(CompositeBody):
     def update_state(self, pos, linear_vel, quat, ang_vel):
         super().update_state(pos, linear_vel, quat, ang_vel)
 
-        prin_axis = Cylinder.compute_principal_axis(quat)
+        prin_axis = torch_quaternion.compute_prin_axis(quat)
         self.end_pts = Cylinder.compute_end_pts_from_state(
             self.state,
             prin_axis,
             self.length
         )
-
-    def update_sites(self, site, pos):
-        self.sites[site] = pos
-
-    def _particle_constraints(self, p0, p1, p2, d0, d1, start_mid_end='mid'):
-        val = None
-        if start_mid_end == 'start':
-            p01 = (p1 - p0).norm(dim=1, keepdim=True)
-            p02 = (p2 - p0).norm(dim=1, keepdim=True)
-            val = p01 - d0 + p02 - d1
-        elif start_mid_end == 'mid':
-            p01 = (p1 - p0).norm(dim=1, keepdim=True)
-            p12 = (p2 - p1).norm(dim=1, keepdim=True)
-            val = p01 - d0 + p12 - d1
-        elif start_mid_end == 'end':
-            p02 = (p2 - p0).norm(dim=1, keepdim=True)
-            p12 = (p2 - p1).norm(dim=1, keepdim=True)
-            val = p02 - d0 + p12 - d1
-        return val
-
-    def rigid_body_constraints(self, node_pos):
-        num_nodes = len(self.rigid_bodies_body_vecs)
-        p0_idx = [num_nodes - 1] + list(range(num_nodes - 1))
-        p1_idx = list(range(num_nodes))
-        p2_idx = list(range(1, num_nodes)) + [0]
-
-        node_pos = node_pos.unsqueeze(-1).transpose(1, 2).reshape(-1, num_nodes, 3).transpose(1, 2)
-        p0 = node_pos[..., p0_idx]
-        p1 = node_pos[..., p1_idx]
-        p2 = node_pos[..., p2_idx]
-
-        p01 = (p0 - p1).norm(dim=1, keepdim=True).transpose(1, 2)
-        p12 = (p1 - p2).norm(dim=1, keepdim=True).transpose(1, 2)
-
-        body_vecs = self.body_vecs_tensor.to(node_pos.device)
-        d01 = (body_vecs[p0_idx] - body_vecs[p1_idx]).norm(dim=1, keepdim=True).transpose(0, 1)
-        d12 = (body_vecs[p2_idx] - body_vecs[p1_idx]).norm(dim=1, keepdim=True).transpose(0, 1)
-        val = p01 - d01 + p12 - d12
-
-        return val
-
-    def rigid_body_jacobian(self, node_pos):
-        num_nodes = len(self.rigid_bodies_body_vecs)
-        p0_idx = [num_nodes - 1] + list(range(num_nodes - 1))
-        p1_idx = list(range(num_nodes))
-        p2_idx = list(range(1, num_nodes)) + [0]
-
-        node_pos = node_pos.unsqueeze(-1).transpose(1, 2).reshape(-1, num_nodes, 3).transpose(1, 2)
-        p0 = node_pos[..., p0_idx]
-        p1 = node_pos[..., p1_idx]
-        p2 = node_pos[..., p2_idx]
-
-        a, c = (p1 - p0).transpose(1, 2), (p2 - p1).transpose(1, 2)
-        a = a / a.norm(dim=2, keepdim=True)
-        c = c / c.norm(dim=2, keepdim=True)
-        b = a - c
-
-        batch_size = node_pos.shape[0]
-        jacobian = zeros((batch_size, num_nodes, 3 * num_nodes),
-                         ref_tensor=node_pos)
-
-        row_idx = torch.arange(0, num_nodes).unsqueeze(1).repeat(1, 3)
-        col_idx = torch.arange(0, 3 * num_nodes).reshape(num_nodes, -1)
-        jacobian[:, row_idx, col_idx] = b
-        jacobian[:, row_idx, col_idx[p0_idx]] = -a
-        jacobian[:, row_idx, col_idx[p2_idx]] = c
-
-        return jacobian
-
-    def compute_rb_constraint_dv(self,
-                                 node_pos,
-                                 temp_vels,
-                                 batch_size,
-                                 dt,
-                                 inv_mass_mat=None,
-                                 jacob=None):
-        if inv_mass_mat is None:
-            inv_mass_mat = self.inv_mass_mat
-
-        if jacob is None:
-            jacob = self.rigid_body_jacobian(node_pos)
-
-        jacob_t = jacob.transpose(1, 2)
-
-        cons_err = self.rigid_body_constraints(node_pos).reshape(batch_size, -1, 1)
-        bias = 0.2 * cons_err / dt
-
-        v = jacob @ temp_vels.reshape(batch_size, -1, 1) + bias
-        vv = torch.linalg.solve(jacob @ (inv_mass_mat @ jacob_t), v)
-        dv = -inv_mass_mat @ (jacob_t @ vv)
-        dv = dv.reshape(node_pos.shape)
-
-        return dv
 
     @property
     def inv_mass_mat(self):

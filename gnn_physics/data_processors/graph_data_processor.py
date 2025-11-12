@@ -1,6 +1,8 @@
-from typing import List, Tuple, Union, NamedTuple
+from enum import Enum
+from typing import List, Tuple, Union, NamedTuple, Dict
 
 import torch
+from torch_geometric.data import Data as GraphData
 
 from gnn_physics.normalizer import AccumulatedNormalizer, DummyNormalizer
 from robots.tensegrity import TensegrityRobotGNN
@@ -38,13 +40,10 @@ class CableEdgeFeats(NamedTuple):
     cable_dist: torch.Tensor
     cable_dist_norm: torch.Tensor
     cable_dir: torch.Tensor
-    # cable_dl: torch.Tensor
     cable_rel_vel_norm: torch.Tensor
     cable_rest_length: torch.Tensor
     cable_stiffness: torch.Tensor
     cable_damping: torch.Tensor
-    # cable_stiffness_force_mag: torch.Tensor
-    # cable_damping_force_mag: torch.Tensor
     cable_ctrls: torch.Tensor
     cable_actuated_mask: torch.Tensor
 
@@ -104,22 +103,41 @@ class PredGnnAttrs(NamedTuple):
     node_hidden_state: torch.Tensor
 
 
-class FastTensegrityGraphDataProcessor(BaseStateObject):
+class CableInputType(Enum):
+    REST_LENS = 'rest_lens'
+    CTRLS = 'ctrls'
+
+
+class GraphDataProcessor(BaseStateObject):
     robot: TensegrityRobotGNN
+    MAX_DIST_TO_GRND: float
+    CONTACT_EDGE_THRESHOLD: float
+    NUM_OUT_STEPS: int
+    NUM_CTRLS_HIST: int
+    NUM_SIMS: int
+    node_hidden_state_size: int
+    cable_input_type: CableInputType
+    node_feat_dict: Dict
+    body_edge_feat_dict: Dict
+    cable_edge_feat_dict: Dict
+    contact_edge_feat_dict: Dict
+    hier_node_feat_dict: Dict
+    hier_edge_feat_dict: Dict
+    dt: torch.Tensor
+    normalizers: Dict
 
     def __init__(self,
                  tensegrity: TensegrityRobotGNN,
                  con_edge_threshold: float = 2e-1,
                  num_out_steps: int = 1,
-                 num_hist: int = 1,
                  dt: float = 0.01,
                  max_dist_to_grnd: float = 0.5,
                  cache_batch_sizes: List | None = None,
-                 num_sims=10,
-                 recur_latent_dim=1024,
-                 num_ctrls_hist=2,
-                 rest_lens_or_ctrls='rest_lens'):
-        super().__init__('fast data processor')
+                 num_sims: int = 10,
+                 node_hidden_state_size: int = 1024,
+                 num_ctrls_hist: int = 2,
+                 cable_input_type: CableInputType = CableInputType.CTRLS):
+        super().__init__('graph data processor')
         """
         @param tensegrity: robot object
         @param con_edge_threshold: threshold to attach edge between ground and endcap node
@@ -132,12 +150,11 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
             self.MAX_DIST_TO_GRND = max_dist_to_grnd
             self.CONTACT_EDGE_THRESHOLD = con_edge_threshold
             self.NUM_OUT_STEPS = num_out_steps
-            self.NUM_HIST = num_hist
             self.NUM_CTRLS_HIST = num_ctrls_hist
             self.NUM_SIMS = num_sims
 
-            self.recur_latent_dim = recur_latent_dim
-            self.rest_lens_or_ctrls = rest_lens_or_ctrls
+            self.node_hidden_state_size = node_hidden_state_size
+            self.cable_input_type = cable_input_type
 
             self.node_feat_dict = {
                 'node_vel': 3,
@@ -145,11 +162,11 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
                 'node_inv_inertia': 3,
                 'node_dist_to_ground': 1,
                 'node_body_verts': 3,
-                # 'node_dist_to_first_node': 3,
-                # 'node_dist_to_first_node_norm': 1,
-                # 'node_dir_from_com': 3,
-                # 'node_dist_from_com_norm': 1,
-                # 'node_prin_axis': 3,
+                'node_dist_to_first_node': 3,
+                'node_dist_to_first_node_norm': 1,
+                'node_dir_from_com': 3,
+                'node_dist_from_com_norm': 1,
+                'node_prin_axis': 3,
                 'node_sim_type': num_sims
             }
 
@@ -167,14 +184,11 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
                 'cable_rel_vel_norm': 1,
                 'cable_stiffness': 1,
                 'cable_damping': 1,
-                # 'cable_stiffness_force_mag': 1,
-                # 'cable_damping_force_mag': 1,
-                # 'cable_ctrls': num_ctrls_hist + num_out_steps
             }
             self.cable_edge_feat_dict['cable_rest_length'] = (
-                1 if rest_lens_or_ctrls == 'ctrls' else self.NUM_OUT_STEPS)
+                1 if cable_input_type == 'ctrls' else self.NUM_OUT_STEPS)
 
-            if rest_lens_or_ctrls == 'ctrls':
+            if cable_input_type == CableInputType.CTRLS:
                 self.cable_edge_feat_dict['cable_ctrls'] = num_ctrls_hist + num_out_steps
 
             self.contact_edge_feat_dict = {
@@ -215,7 +229,7 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
                 for k, v in {**flatten_node_feats, **flatten_edge_feats}.items()
             }
 
-            if self.rest_lens_or_ctrls == 'ctrls':
+            if self.cable_input_type == CableInputType.CTRLS:
                 self.normalizers['cable_ctrls'] = DummyNormalizer(
                     (1, self.hier_edge_feat_dict['cable']['cable_ctrls']),
                     name='cable_ctrls',
@@ -850,32 +864,12 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
         cable_stiffness = self._feats_batch_cache[batch_size].cable_stiffness
         cable_damping = self._feats_batch_cache[batch_size].cable_damping
 
-        if self.rest_lens_or_ctrls == 'ctrls':
+        if self.cable_input_type == CableInputType.CTRLS:
             cable_act_rest_lengths = torch.hstack([
                 c.rest_length
-                for cable in self.robot.actuated_cables.values()
-                for c in [cable, cable]
-            ])
-        else:
-            cable_act_rest_lengths = self.robot.gnn_rest_lens.repeat_interleave(2, dim=1)
+                for c in self.robot.actuated_cables.values()
+            ]).repeat_interleave(2, dim=1)
 
-        cable_non_act_rest_lengths = torch.hstack([
-            c.rest_length.repeat(batch_size, 1, cable_act_rest_lengths.shape[-1])
-            for cable in self.robot.non_actuated_cables.values()
-            for c in [cable, cable]
-        ])
-        cable_rest_lengths = torch.hstack([
-            cable_act_rest_lengths,
-            cable_non_act_rest_lengths
-        ]).reshape(-1, self.cable_edge_feat_dict['cable_rest_length'])
-
-        # cable_rest_lengths = cable_act_rest_lengths.reshape(-1, self.cable_edge_feat_dict['cable_rest_length'])
-
-        # cable_dl = torch.clamp_min(cable_dists_norm - cable_rest_lengths, 0)
-        # cable_stiffness_force_mag = cable_stiffness * cable_dl
-        # cable_damping_force_mag = cable_damping * cable_rel_vel_norm
-
-        if self.rest_lens_or_ctrls == 'ctrls':
             num_nonact_cables = len(self.robot.non_actuated_cables)
             num_ctrls = self.NUM_CTRLS_HIST + self.NUM_OUT_STEPS
             nonact_ctrls = zeros((ctrls.shape[0], num_nonact_cables, num_ctrls), ref_tensor=ctrls)
@@ -883,23 +877,35 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
                            .repeat_interleave(2, dim=1)
                            .reshape(-1, num_ctrls))
         else:
+            cable_act_rest_lengths = self.robot.gnn_rest_lens.repeat_interleave(2, dim=1)
             cable_ctrls = None
 
+        if len(self.robot.non_actuated_cables) > 0:
+            cable_non_act_rest_lengths = torch.hstack([
+                c.rest_length.repeat(batch_size, 1, cable_act_rest_lengths.shape[-1])
+                for c in self.robot.non_actuated_cables.values()
+            ]).repeat_interleave(2, dim=1)
+        else:
+            cable_non_act_rest_lengths = zeros(
+                (cable_act_rest_lengths.shape[0], 0),
+                ref_tensor=cable_act_rest_lengths
+            )
+
+        cable_rest_lengths = torch.hstack([
+            cable_act_rest_lengths,
+            cable_non_act_rest_lengths
+        ]).reshape(-1, self.cable_edge_feat_dict['cable_rest_length'])
+
         cable_act_mask = self._feats_batch_cache[batch_size].cable_actuated_mask
-
-
 
         cable_edge_feats = CableEdgeFeats(
             cable_dist=cable_dists,
             cable_dist_norm=cable_dists_norm,
             cable_dir=cable_dir,
-            # cable_dl=cable_dl,
             cable_rel_vel_norm=cable_rel_vel_norm,
             cable_rest_length=cable_rest_lengths,
             cable_stiffness=cable_stiffness,
             cable_damping=cable_damping,
-            # cable_stiffness_force_mag=cable_stiffness_force_mag,
-            # cable_damping_force_mag=cable_damping_force_mag,
             cable_ctrls=cable_ctrls,
             cable_actuated_mask=cable_act_mask
         )
@@ -988,7 +994,7 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
         )
 
         node_hidden_state = zeros(
-            (node_raw_feats.node_pos.shape[0], self.recur_latent_dim),
+            (node_raw_feats.node_pos.shape[0], self.node_hidden_state_size),
             ref_tensor=node_raw_feats.node_pos
         )
 
@@ -1030,3 +1036,17 @@ class FastTensegrityGraphDataProcessor(BaseStateObject):
         )
 
         return graph_feats, raw_feats
+
+    @staticmethod
+    def feats2graph(graph_feats: GraphFeats, raw_feats: List):
+        combined_graph_feats = {
+            **graph_feats._asdict(),
+            **{k: v for raw_feat in raw_feats for k, v in raw_feat._asdict().items()},
+            'cable_edge_index': graph_feats.cable_edge_idx.to(torch.long),
+            'contact_edge_index': graph_feats.contact_edge_idx.to(torch.long),
+            'body_edge_index': graph_feats.body_edge_idx.to(torch.long),
+            'pos': raw_feats[0].node_pos,
+            'vel': raw_feats[0].node_vel,
+        }
+        graph = GraphData(**combined_graph_feats)
+        return graph
