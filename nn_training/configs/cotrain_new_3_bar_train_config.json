@@ -41,6 +41,6 @@
     "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_4"
   ],
   "load_sim": false,
-  "load_sim_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp/best_rollout_model.pt",
-  "output_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp/"
+  "load_sim_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp2/best_rollout_model.pt",
+  "output_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp2/"
 }

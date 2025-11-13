@@ -1626,7 +1626,7 @@ class TensegrityMultiSimGNNTrainingEngine(TensegrityGNNTrainingEngine):
             controls = torch.cat(all_controls[i], dim=-1).to(self.device) if not self.use_gt_act_lens else None
             gt_act_lens = torch.cat(act_lengths[i][1:], dim=-1).to(self.device) if self.use_gt_act_lens else None
 
-            all_states, graphs = self.simulator.run(
+            all_states, graphs, _ = self.simulator.run(
                 curr_state=curr_state,
                 dt=self.dt,
                 ctrls=controls,
@@ -1740,7 +1740,7 @@ class TensegrityMultiSimMultiStepGNNTrainingEngine(TensegrityMultiSimGNNTraining
 
         return sim
 
-    def compute_node_loss(self, graphs, gt_end_pts, dt):
+    def compute_node_loss(self, graphs, x, gt_end_pts, dt):
         norm_pred_dv, norm_gt_dv = [], []
         body_mask = graphs[0].body_mask.flatten()
 
@@ -1766,6 +1766,8 @@ class TensegrityMultiSimMultiStepGNNTrainingEngine(TensegrityMultiSimGNNTraining
                 gt_node_vel = (gt_nodes_pos - prev_gt_pos) / dt
                 gt_node_dv = gt_node_vel - prev_gt_vel
                 graph_gt_dv.append(gt_node_dv)
+
+                end_pts_diff = self._batch_compute_end_pts(x).reshape(-1, 6, 1) - end_pts
 
                 # tmp_loss = self.loss_fn(
                 #     graph.p_pos[body_mask, :, j],
@@ -2185,12 +2187,18 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMultiS
                 batch['x'], batch['y'] = self.rotate_data_aug(batch['x'], batch['y'])
 
             graphs = self.batch_sim_ctrls(batch)
-            losses = self.compute_node_loss(graphs, batch['y'], self.dt)
+            losses = self.compute_node_loss(graphs, batch['x'], batch['y'], self.dt)
 
-            # cable_dls = batch['next_act_lens'] - batch['act_len']
-            act_lens, next_act_lens = batch['act_len'], batch['next_act_lens']
-            cable_dls = next_act_lens - torch.concat([act_lens, next_act_lens[..., :-1]], dim=2)
-            norm_cable_loss, cable_loss = self.compute_cable_dl_loss(graphs, cable_dls)
+            pos = batch['x'].reshape(-1, 13, 1)[:, :3]
+            quat = batch['x'].reshape(-1, 13, 1)[:, 3:7]
+            node_pos = self.simulator.data_processor.pose2node(pos, quat, batch['x'].shape[0])
+
+            if self.use_gt_act_lens:
+                norm_cable_loss, cable_loss = 0.0, 0.0
+            else:
+                act_lens, next_act_lens = batch['act_len'], batch['next_act_lens']
+                cable_dls = next_act_lens - torch.concat([act_lens, next_act_lens[..., :-1]], dim=2)
+                norm_cable_loss, cable_loss = self.compute_cable_dl_loss(graphs, cable_dls)
 
             backward_loss = losses[0] + (5 / self.num_steps_fwd) * norm_cable_loss
             losses = [backward_loss, norm_cable_loss.detach().item(), cable_loss] + [l for l in losses[1:]]

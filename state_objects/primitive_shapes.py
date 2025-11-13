@@ -20,7 +20,7 @@ class Cylinder(RigidBody):
                  sites: List):
         self.end_pts = end_pts
         if isinstance(end_pts, torch.Tensor):
-            self.end_pts = end_pts.reshape(-1, 2, 3).transpose(1, 2)
+            self.end_pts = end_pts.reshape(-1, 3, 2)
             self.end_pts = [self.end_pts[:, :, :1], self.end_pts[:, :, 1:]]
 
         self.radius = radius

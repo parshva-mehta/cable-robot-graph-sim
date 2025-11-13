@@ -125,6 +125,8 @@ class Encoder(nn.Module):
             self.node_recurrent_block = recurr_block_fn(nn.GRUCell(n_out, n_out))
             self.cable_recurrent_block = recurr_block_fn(nn.GRUCell(n_out, n_out))
             self.recur_fwd_fn = self.rnn_gru_forward
+        elif self.recurrent_type is None:
+            self.recur_fwd_fn = None
         else:
             raise Exception("recurrent_type not valid")
 
