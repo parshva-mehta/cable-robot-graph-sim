@@ -4,12 +4,20 @@
     0.0,
     -9.81
   ],
-  "processor_shared_weights": false,
-  "n_out": 12,
-  "latent_dim": 512,
-  "nmessage_passing_steps": 4,
-  "nmlp_layers": 2,
-  "mlp_hidden_dim": 512,
+  "dt": 0.01,
+  "num_ctrls_hist": 20,
+  "num_sims": 10,
+  "gnn_params": {
+    "processor_shared_weights": false,
+    "n_out": 3,
+    "latent_dim": 512,
+    "nmessage_passing_steps": 4,
+    "nmlp_layers": 2,
+    "mlp_hidden_dim": 512,
+    "n_fwd_pred_steps": 4,
+    "use_cable_decoder": true,
+    "recurrent_type": null
+  },
   "tensegrity_cfg": {
     "name": "6bar",
     "rods": [

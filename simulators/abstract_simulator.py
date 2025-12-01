@@ -109,6 +109,6 @@ class LearnedSimulator(AbstractSimulator):
     def run(self,
             curr_state: torch.Tensor,
             ctrls: List[torch.Tensor] | torch.Tensor | None,
-            num_steps: int,
+            num_steps: int | None = None,
             **kwargs):
         raise NotImplementedError

@@ -616,7 +616,7 @@ class TensegrityGnnMPPI(torch.nn.Module):
                     self.rollout(curr_state_.cpu().clone(), batch_actions)
 
                 total_costs = torch.stack(costs, dim=-1).sum()
-                total_costs.backward()
+                total_costs._backward()
                 torch.nn.utils.clip_grad_norm_(actions,
                                                max_norm=100)
                 optimizer.step()

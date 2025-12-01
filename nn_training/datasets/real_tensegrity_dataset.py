@@ -6,6 +6,9 @@ import torch
 from utilities import misc_utils
 
 
+MIN_REAL_Y_DT = 0.04
+
+
 class RealMultiSimTensegrityDataset(TensegrityDataset):
 
     def __init__(self,
@@ -16,20 +19,18 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                  target_dt,
                  mix_ratio,
                  num_steps_fwd=1,
-                 num_hist=1,
                  num_ctrls_hist=20,
                  dt=0.01,
                  dtype=DEFAULT_DTYPE):
+        super(TensegrityDataset, self).__init__()
         self.min_dt = min_dt
         self.max_dt = max_dt
         self.target_dt = target_dt
         self.mix_ratio = mix_ratio
         self.num_steps_fwd = num_steps_fwd
-        self.num_hist = num_hist
         self.dt = dt
         self.dtype = dtype
         self.num_ctrls_hist = num_ctrls_hist
-        self.real_y_dt = 0.0
 
         self.real_processed_data = self._process_raw_data(raw_real_data_dict, is_sim=False)
         self.sim_processed_data = self._process_raw_data(raw_sim_data_dict, is_sim=True)
@@ -111,7 +112,7 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                 mask = torch.zeros((1, 1, num_steps), dtype=torch.int)
                 y = end_pts[0].reshape(1, -1, 1).repeat(1, 1, num_steps)
                 for m, t in enumerate(curr_times[1:]):
-                    if not is_sim and round(t - t0, 5) < self.real_y_dt:
+                    if not is_sim and round(t - t0, 5) < MIN_REAL_Y_DT:
                         continue
                     idx = round((t - t0) / self.dt) - 1
                     y[..., idx] = end_pts[j + 1 + m].reshape(1, -1)
@@ -139,23 +140,6 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                     'motor_omega': motor_speed
                 }
                 processed_data.append(processed_instance)
-
-        # max_dt = torch.vstack([d['delta_t'] for d in processed_data]).max().item()
-        # for d in processed_data:
-        #     dt = d['delta_t'].item()
-        #     if abs(max_dt - dt) > 1e-5:
-        #         n = round((max_dt - dt) / self.dt)
-        #         ctrl, next_act_lens, mask, y = d['ctrl'], d['next_act_lens'], d['mask'], d['y']
-        #
-        #         ctrl_pad = zeros((ctrl.shape[0], ctrl.shape[1], n), ref_tensor=ctrl)
-        #         next_act_lens_pad = next_act_lens[..., -1:].repeat(1, 1, n)
-        #         mask_pad = torch.zeros((1, 1, n), dtype=torch.int)
-        #         y_pad = y[..., -1:].repeat(1, 1, n)
-        #
-        #         d['ctrl'] = torch.cat([ctrl, ctrl_pad], dim=-1)
-        #         d['next_act_lens'] = torch.cat([next_act_lens, next_act_lens_pad], dim=-1)
-        #         d['mask'] = torch.cat([mask, mask_pad], dim=-1)
-        #         d['y'] = torch.cat([y, y_pad], dim=-1)
 
         return processed_data
 
@@ -196,52 +180,3 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
             collated_batch_dict[k] = torch.vstack([b[k] for b in batch])
 
         return collated_batch_dict
-
-
-class RealMultiSimRecurMotorTensegrityDataset(RealMultiSimTensegrityDataset):
-
-    def __init__(self,
-                 raw_real_data_dict,
-                 raw_sim_data_dict,
-                 min_dt,
-                 max_dt,
-                 target_dt,
-                 mix_ratio,
-                 num_steps_fwd=1,
-                 num_hist=1,
-                 num_ctrls_hist=20,
-                 dt=0.01,
-                 dtype=DEFAULT_DTYPE):
-        self.num_ctrls_hist = num_ctrls_hist
-        super().__init__(raw_real_data_dict,
-                         raw_sim_data_dict,
-                         min_dt,
-                         max_dt,
-                         target_dt,
-                         mix_ratio,
-                         num_steps_fwd,
-                         num_hist,
-                         dt,
-                         dtype)
-
-    def _process_raw_data(self, raw_data_dict, is_sim=False):
-        processed_data = super()._process_raw_data(raw_data_dict, is_sim=is_sim)
-
-        k = 0
-        for i in range(len(raw_data_dict['states'])):
-            controls = torch.vstack(raw_data_dict['controls'][i])
-
-            end = controls.shape[0] if self.num_steps_fwd == 1 else -self.num_steps_fwd + 1
-            ctrls_hist = raw_data_dict['controls'][i][:end]
-            ctrls_hist_pad = [torch.zeros_like(ctrls_hist[0]) for _ in range(self.num_ctrls_hist)]
-            ctrls_hist = ctrls_hist_pad + ctrls_hist
-
-            traj_ctrls_hist = [torch.stack(ctrls_hist[j - self.num_ctrls_hist: j], 2)
-                               if self.num_ctrls_hist > 0 else torch.empty(ctrls_hist[0].shape)
-                               for j in range(self.num_ctrls_hist, len(ctrls_hist))]
-
-            for ctrls_hist in traj_ctrls_hist:
-                processed_data[k]['ctrls_hist'] = ctrls_hist
-                k += 1
-
-        return processed_data

@@ -38,7 +38,7 @@ def train():
         cfg['save_code'] = save_code
         cfg['batch_size_per_step'] = batch_size
         cfg['batch_size_per_update'] = batch_size
-        cfg['eval_stepsize'] = eval_step
+        cfg['eval_step_size'] = eval_step
 
         save_code = False
         trainer = TensegrityMultiSimMultiStepMotorGNNTrainingEngine(cfg, logger)
