@@ -175,8 +175,6 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                 b['mask'] = torch.cat([mask, mask_pad], dim=-1)
                 b['y'] = torch.cat([y, y_pad], dim=-1)
 
-        collated_batch_dict = {}
-        for k in batch[0].keys():
-            collated_batch_dict[k] = torch.vstack([b[k] for b in batch])
+        collated_batch_dict = super().collate_fn(batch)
 
         return collated_batch_dict

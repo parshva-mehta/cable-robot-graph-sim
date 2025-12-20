@@ -18,16 +18,14 @@ class TensegrityGNNSimulator(LearnedSimulator):
             gnn_params,
             tensegrity_cfg,
             dt=0.01,
-            num_sims: int = 10,
+            num_datasets: int = 10,
             num_ctrls_hist: int = 20,
-            use_gt_act_lens: bool = False,
             cache_batch_sizes: List[int] | None = None
     ):
         self.use_cable_decoder = gnn_params['use_cable_decoder']
 
         self.num_out_steps = gnn_params['n_fwd_pred_steps']
         self.num_ctrls_hist = num_ctrls_hist
-        self.num_ctrls_per_cable = num_ctrls_hist + self.num_out_steps
 
         self.ctrls_hist = None
         self.node_hidden_state = None
@@ -40,7 +38,7 @@ class TensegrityGNNSimulator(LearnedSimulator):
             'node_hidden_state_size': gnn_params['latent_dim'],
             'num_out_steps': self.num_out_steps,
             'num_ctrls_hist': self.num_ctrls_hist,
-            'num_sims': num_sims
+            'num_sims': num_datasets
         }
 
         if gnn_params['recurrent_type'] == RecurrentType.LSTM.value:
@@ -92,18 +90,18 @@ class TensegrityGNNSimulator(LearnedSimulator):
     def _get_data_processor(self):
         return GraphDataProcessor(**self.data_processor_params)
 
-    def generate_graph(self, state, **kwargs):
+    def _generate_graph(self, state, **kwargs):
         batch_size = state.shape[0]
         if batch_size not in self.data_processor.cached_batch_size_keys:
             self.data_processor.precompute_and_cache_batch_sizes([batch_size])
 
         graph_feats, raw_feats = self.data_processor(state, **kwargs)
         graph = self.data_processor.feats2graph(graph_feats, raw_feats)
-        graph = self.add_hidden_state(graph)
+        graph = self._add_hidden_state(graph)
 
         return graph
 
-    def process_gnn(self, graph, **kwargs):
+    def _process_gnn(self, graph, **kwargs):
         graph = self._encode_process_decode(graph)
 
         dv_normalizer = self.data_processor.normalizers['node_dv']
@@ -133,7 +131,7 @@ class TensegrityGNNSimulator(LearnedSimulator):
 
         return graph
 
-    def add_hidden_state(self, graph):
+    def _add_hidden_state(self, graph):
         if self.node_hidden_state is not None:
             graph[f'node_hidden_state'] = self.node_hidden_state.clone()
 
@@ -172,8 +170,8 @@ class TensegrityGNNSimulator(LearnedSimulator):
 
         self.update_state(curr_state)
 
-        graph = self.generate_graph(curr_state, **state_to_graph_kwargs)
-        next_graph = self.process_gnn(graph, **gnn_kwargs)
+        graph = self._generate_graph(curr_state, **state_to_graph_kwargs)
+        next_graph = self._process_gnn(graph, **gnn_kwargs)
 
         body_mask = next_graph.body_mask.flatten()
         next_state = self.data_processor.node2pose(
@@ -258,23 +256,3 @@ class TensegrityGNNSimulator(LearnedSimulator):
             ])
 
         return states[:num_steps], graphs, rest_lens[:num_steps]
-
-    # def run_target_gait(self,
-    #                     curr_state: torch.Tensor,
-    #                     state_to_graph_kwargs: List[Dict] | Dict | None = None,
-    #                     gnn_kwargs: List[Dict] | Dict | None = None,
-    #                     **kwargs):
-    #     if state_to_graph_kwargs is None:
-    #         state_to_graph_kwargs = {}
-    #     if gnn_kwargs is None:
-    #         gnn_kwargs = {}
-    #
-    #     pids = [PID(min_length=0.9, RANGE=1.1, tol=0.1) for _ in range(self.robot.actuated_cables)]
-    #
-    #     ctrls = torch.ones(
-    #         (curr_state.shape[0], len(self.robot.actuated_cables), 1),
-    #         device=curr_state.device
-    #     )
-    #     step = 0
-    #     while (ctrls != 0.0).any() or step < 1000:
-    #         for cable in self.robot.actuated_cables.values():

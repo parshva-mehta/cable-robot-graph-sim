@@ -26,9 +26,6 @@ class AbstractSimulator(BaseStateObject):
         """
         raise NotImplementedError()
 
-    def apply_control(self, control_signals, dt) -> None:
-        raise NotImplementedError()
-
     def step(self,
              curr_state: torch.Tensor,
              dt: torch.Tensor | float,
@@ -72,6 +69,9 @@ class LearnedSimulator(AbstractSimulator):
     def _build_gnn(self, **kwargs):
         raise NotImplementedError()
 
+    def _process_gnn(self, graph, **kwargs):
+        raise NotImplementedError()
+
     def to(self, device):
         super().to(device)
         self.dt = self.dt.to(device)
@@ -92,9 +92,6 @@ class LearnedSimulator(AbstractSimulator):
                          gnn_kwargs,
                          **kwargs)
 
-    def process_gnn(self, graph, **kwargs):
-        raise NotImplementedError()
-
     def step(self,
              curr_state: torch.Tensor,
              ctrls: Optional[torch.Tensor] = None,
@@ -103,12 +100,9 @@ class LearnedSimulator(AbstractSimulator):
              **kwargs):
         raise NotImplementedError()
 
-    def apply_controls(self, ctrls):
-        raise NotImplementedError
-
     def run(self,
             curr_state: torch.Tensor,
             ctrls: List[torch.Tensor] | torch.Tensor | None,
             num_steps: int | None = None,
             **kwargs):
-        raise NotImplementedError
+        raise NotImplementedError()

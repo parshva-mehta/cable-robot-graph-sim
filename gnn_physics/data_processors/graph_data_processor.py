@@ -114,7 +114,7 @@ class GraphDataProcessor(BaseStateObject):
     CONTACT_EDGE_THRESHOLD: float
     NUM_OUT_STEPS: int
     NUM_CTRLS_HIST: int
-    NUM_SIMS: int
+    NUM_DATASETS: int
     node_hidden_state_size: int
     cable_input_type: CableInputType
     node_feat_dict: Dict
@@ -133,7 +133,7 @@ class GraphDataProcessor(BaseStateObject):
                  dt: float = 0.01,
                  max_dist_to_grnd: float = 0.5,
                  cache_batch_sizes: List | None = None,
-                 num_sims: int = 10,
+                 num_datasets: int = 10,
                  node_hidden_state_size: int = 1024,
                  num_ctrls_hist: int = 2,
                  cable_input_type: CableInputType = CableInputType.CTRLS):
@@ -151,7 +151,7 @@ class GraphDataProcessor(BaseStateObject):
             self.CONTACT_EDGE_THRESHOLD = con_edge_threshold
             self.NUM_OUT_STEPS = num_out_steps
             self.NUM_CTRLS_HIST = num_ctrls_hist
-            self.NUM_SIMS = num_sims
+            self.NUM_DATASETS = num_datasets
 
             self.node_hidden_state_size = node_hidden_state_size
             self.cable_input_type = cable_input_type
@@ -167,7 +167,7 @@ class GraphDataProcessor(BaseStateObject):
                 'node_dir_from_com': 3,
                 'node_dist_from_com_norm': 1,
                 'node_prin_axis': 3,
-                'node_sim_type': num_sims
+                'node_sim_type': num_datasets
             }
 
             self.body_edge_feat_dict = {
@@ -735,7 +735,7 @@ class GraphDataProcessor(BaseStateObject):
         num_nodes = self.robot.num_nodes + 1
         batch_idxs = batch_idxs.repeat(1, num_nodes).reshape(-1, 1)
         vecs = torch.zeros(
-            (batch_idxs.shape[0], self.NUM_SIMS),
+            (batch_idxs.shape[0], self.NUM_DATASETS),
             dtype=self.dtype,
             device=self.device
         )

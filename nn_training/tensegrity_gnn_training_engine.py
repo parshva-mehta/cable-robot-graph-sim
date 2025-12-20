@@ -17,8 +17,8 @@ from utilities import torch_quaternion
 from utilities.misc_utils import save_curr_code, DEFAULT_DTYPE
 
 
-MAX_NO_IMPROVE = 10
-PRINT_STEP = 100
+MAX_EPOCH_NO_IMPROVE = 10
+NUM_PRINT_STATUS_STEP = 100
 
 
 class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
@@ -71,7 +71,6 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
                 self.sim_config = json.load(j)
 
         # Load relevant constants from cfg
-        self.use_gt_cable_dl = training_config.get('use_gt_cable_dl', False)
         self.num_ctrls_hist = self.sim_config.get('num_ctrls_hist', 1)
         self.num_sims = training_config.get('num_sims', 10)
         self.dt = self.sim_config['dt']
@@ -79,7 +78,6 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         self.config = training_config
         self.num_steps_fwd = self.config.get('num_steps_fwd', 1)
         self.num_hist = self.config.get('num_hist', 1)
-        self.save_rollout_vids = self.config.get('save_rollout_vids', False)
         self.use_gt_act_lens = self.config.get('use_gt_act_lens', False)
         self.batch_size_per_update = self.config.get('batch_size_per_update', 128)
         self.batch_size_per_step = self.config.get('batch_size_per_step', 128)
@@ -147,21 +145,9 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         data_dict['names'] = [p.name for p in data_paths]
 
         data_jsons, extra_state_infos = self._load_json_files(data_paths)
+        self._check_and_mod_data_length(data_jsons, extra_state_infos)
+        data_dict.update({'data_jsons': data_jsons, 'extra_state_infos': extra_state_infos})
         self.logger.info("Loaded data jsons")
-
-        for i in range(len(data_jsons)):
-            data_json, extra_state_info = data_jsons[i], extra_state_infos[i]
-            if len(data_json) == len(extra_state_info):
-                continue
-            elif len(data_json) - len(extra_state_info) == 1:
-                data_jsons[i] = data_json[:-1]
-            elif len(data_json) - len(extra_state_info) == -1:
-                extra_state_infos[i] = extra_state_info[:-1]
-            else:
-                raise Exception("Data lengths between processed data and extra state info does not match")
-
-        data_dict.update({'data_jsons': data_jsons,
-                          'extra_state_infos': extra_state_infos})
 
         data_dict['gt_end_pts'] = self._get_end_pts(data_jsons)
         self.logger.info("Loaded end points")
@@ -186,9 +172,28 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
 
         return data_dict
 
-    @staticmethod
-    def _enum_dataset(data_paths):
-        dataset_idx = [int(Path(p).parent.name.split("_")[-1]) for p in data_paths]
+    def _check_and_mod_data_length(self, data_jsons, extra_state_infos):
+        for i in range(len(data_jsons)):
+            data_json, extra_state_info = data_jsons[i], extra_state_infos[i]
+            if len(data_json) == len(extra_state_info):
+                continue
+            elif len(data_json) - len(extra_state_info) == 1:
+                data_jsons[i] = data_json[:-1]
+            elif len(data_json) - len(extra_state_info) == -1:
+                extra_state_infos[i] = extra_state_info[:-1]
+            else:
+                raise Exception("Data lengths between processed data and extra state info does not match")
+
+    def _enum_dataset(self, data_paths):
+        dataset_idx = []
+        for p in data_paths:
+            p = Path(p)
+            try:
+                idx = int(p.parent.name.split("_")[-1])
+            except Exception:
+                self.logger.info(f"No dataset index for {p.parent.name}, defaulting to 0")
+                idx = 0
+            dataset_idx.append(idx)
         return dataset_idx
 
     def _compute_node_loss(self, graphs, gt_end_pts, dt):
@@ -261,11 +266,10 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
             sim = TensegrityGNNSimulator(
                 gnn_params=self.sim_config['gnn_params'],
                 tensegrity_cfg=self.sim_config['tensegrity_cfg'],
-                num_sims=self.sim_config['num_sims'],
+                num_datasets=self.sim_config['num_sims'],
                 num_ctrls_hist=self.sim_config['num_ctrls_hist'],
                 dt=self.sim_config['dt'],
-                cache_batch_sizes=[self.batch_size_per_step],
-                use_gt_act_lens=self.use_gt_act_lens
+                cache_batch_sizes=[self.batch_size_per_step]
             )
 
         return sim
@@ -335,7 +339,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
                 l * batch['x'].shape[0] for l in losses[1:]
             ])
 
-            if curr_batch % PRINT_STEP == 0:
+            if curr_batch % NUM_PRINT_STATUS_STEP == 0:
                 avg_other_losses = [
                     sum(l) / num_train
                     for l in zip(*total_other_losses)
@@ -356,34 +360,31 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         batch_state = batch['x']
         controls = batch['ctrl']
         act_lens = batch['act_len']
+        next_act_lens = batch['next_act_lens']
         dataset_idx = batch['dataset_idx']
-
-        num_out_steps = self.simulator.num_out_steps
 
         self.simulator.reset(
             act_lens=act_lens[..., -1:].clone(),
             ctrls_hist=batch['ctrls_hist'].clone()
         )
 
-        num_steps = math.ceil(round(self.num_steps_fwd / num_out_steps, 5))
+        curr_state = batch_state[..., -1:].clone()
+        if self.use_gt_act_lens:
+            gt_act_lens, ctrls = [], None
+            for i in range(self.num_steps_fwd):
+                gt_act_lens.append(next_act_lens[:, :, i: i + 1].clone())
+                ctrls = None
+            gt_act_lens = torch.cat(gt_act_lens, dim=-1)
+        else:
+            gt_act_lens, ctrls = None, controls.clone()
 
-        curr_states = batch_state[..., -1:].clone()
-        graphs = []
-
-        for i in range(num_steps):
-            num_inner_steps = self.num_steps_fwd - i * num_out_steps
-            step_diff = num_out_steps - num_inner_steps
-            ctrls = controls[..., i * num_out_steps: (i + 1) * num_out_steps]
-            if step_diff > 0:
-                pad = torch.zeros_like(controls[..., :1]).repeat(1, 1, step_diff)
-                ctrls = torch.cat([ctrls, pad], dim=-1)
-
-            curr_states, graph = self.simulator.step(
-                curr_states[..., -1:],
-                ctrls=ctrls.clone(),
-                state_to_graph_kwargs={"dataset_idx": dataset_idx}
-            )
-            graphs.append(graph)
+        states, graphs = self.simulator.run(
+            curr_state=curr_state,
+            dt=self.dt,
+            ctrls=ctrls,
+            gt_act_lens=gt_act_lens,
+            state_to_graph_kwargs={"dataset_idx": dataset_idx}
+        )
 
         return graphs
 
@@ -583,7 +584,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         else:
             self.num_no_improve += 1
 
-        if self.num_no_improve > MAX_NO_IMPROVE:
+        if self.num_no_improve > MAX_EPOCH_NO_IMPROVE:
             self.logger.info("No improvement, lowering learning rate")
             self.best_train_loss = train_losses[0]
             self.num_no_improve = 0

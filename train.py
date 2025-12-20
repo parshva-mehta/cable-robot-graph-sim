@@ -10,18 +10,14 @@ def train():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch._dynamo.config.cache_size_limit = 512
     np.set_printoptions(precision=64)
+
     config_file_path = "nn_training/configs/cotrain_new_3_bar_train_config.json"
-    # config_file_path = "nn_training/configs/multi_sim_new_3_bar_train_config.json"
-    # config_file_path = "nn_training/configs/test.json"
-    # config_file_path = "nn_training/configs/3_bar_train_config.json"
     with open(config_file_path, 'r') as j:
         cfg = json.load(j)
     Path(cfg['output_path']).mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(cfg['output_path'])
     save_code = True
-    # idxs.add(datasets[0])
-    # logger.info(f"Eval on dataset {datasets[0]}")
 
     num_steps = [4, 4, 8, 8, 16]
     epochs = [100, 50, 120, 60, 30, 30, 15]
