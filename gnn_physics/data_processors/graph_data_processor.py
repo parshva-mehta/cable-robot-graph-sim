@@ -99,30 +99,25 @@ class CacheableFeats(NamedTuple):
     cable_actuated_mask: torch.Tensor
     contact_normal: torch.Tensor
     body_edge_idx: torch.Tensor
-    body_edge_agg_idx: torch.Tensor
     cable_edge_idx: torch.Tensor
-    cable_edge_agg_idx: torch.Tensor
     contact_edge_idx: torch.Tensor
-    contact_edge_agg_idx: torch.Tensor
     body_mask: torch.Tensor
 
 
 class GraphFeats(NamedTuple):
-    """Complete graph feature set ready for GNN processing.
+    """
+    Complete graph feature set ready for GNN processing.
 
     Contains all normalized node features, edge features, edge indices,
-    and aggregation indices needed for graph neural network forward pass.
+    needed for graph neural network forward pass.
     """
     node_x: torch.Tensor
     body_edge_attr: torch.Tensor
     body_edge_idx: torch.Tensor
-    body_edge_agg_idx: torch.Tensor
     cable_edge_attr: torch.Tensor
     cable_edge_idx: torch.Tensor
-    cable_edge_agg_idx: torch.Tensor
     contact_edge_attr: torch.Tensor
     contact_edge_idx: torch.Tensor
-    contact_edge_agg_idx: torch.Tensor
     contact_close_mask: torch.Tensor
     node_hidden_state: torch.Tensor
 
@@ -246,10 +241,8 @@ class GraphDataProcessor(BaseStateObject):
                 'cable_rel_vel_norm': 1,
                 'cable_stiffness': 1,
                 'cable_damping': 1,
+                'cable_rest_length': 1 if cable_input_type == CableInputType.CTRLS else self.NUM_OUT_STEPS
             }
-            self.cable_edge_feat_dict['cable_rest_length'] = (
-                1 if cable_input_type == CableInputType.CTRLS else self.NUM_OUT_STEPS
-            )
 
             if cable_input_type == CableInputType.CTRLS:
                 self.cable_edge_feat_dict['cable_ctrls'] = num_ctrls_hist + num_out_steps
@@ -330,11 +323,6 @@ class GraphDataProcessor(BaseStateObject):
 
             self.body_mask = self._get_body_mask(1, self.device)
 
-            num_nodes = contact_node_idx + 1
-            self.body_edge_agg_idx_template = self._compute_edge_agg_idx(self.body_edge_idx_template, num_nodes)
-            self.cable_edge_agg_idx_template = self._compute_edge_agg_idx(self.cable_edge_idx_template, num_nodes)
-            self.contact_edge_agg_idx_template = self._compute_edge_agg_idx(self.contact_edge_idx_template, num_nodes)
-
             self.robot_inv_mass = torch.vstack([
                 self.robot.inv_mass, torch.zeros_like(self.robot.inv_mass[:1])
             ])
@@ -358,9 +346,11 @@ class GraphDataProcessor(BaseStateObject):
             body_rcvrs = torch.tensor(
                 [[-1] * n_rods + [1] * n_rods], device=self.device,
             ).reshape(-1, 1)
-            self.contact_normal = body_rcvrs * torch.tensor([[0., 0., 1.]],
-                                                            dtype=self.dtype,
-                                                            device=self.device)
+            self.contact_normal = body_rcvrs * torch.tensor(
+                [[0., 0., 1.]],
+                dtype=self.dtype,
+                device=self.device
+            )
 
             num_act_cables = len(self.robot.actuated_cables) * 2
             num_nonact_cables = len(self.robot.non_actuated_cables) * 2
@@ -391,10 +381,6 @@ class GraphDataProcessor(BaseStateObject):
         self.body_edge_idx_template = self.body_edge_idx_template.to(device)
         self.cable_edge_idx_template = self.cable_edge_idx_template.to(device)
         self.contact_edge_idx_template = self.contact_edge_idx_template.to(device)
-
-        self.body_edge_agg_idx_template = self.body_edge_agg_idx_template.to(device)
-        self.cable_edge_agg_idx_template = self.cable_edge_agg_idx_template.to(device)
-        self.contact_edge_agg_idx_template = self.contact_edge_agg_idx_template.to(device)
 
         self.robot_inv_mass = self.robot_inv_mass.to(device)
         self.robot_inv_inertia = self.robot_inv_inertia.to(device)
@@ -475,16 +461,6 @@ class GraphDataProcessor(BaseStateObject):
         cable_edge_idx = self.batch_edge_index(self.cable_edge_idx_template, bsize, nnodes)
         contact_edge_idx = self.batch_edge_index(self.contact_edge_idx_template, bsize, nnodes)
 
-        body_edge_agg_idx = self._batch_edge_agg_idx(
-            self.body_edge_agg_idx_template, self.body_edge_idx_template.shape[1], bsize
-        )
-        cable_edge_agg_idx = self._batch_edge_agg_idx(
-            self.cable_edge_agg_idx_template, self.cable_edge_idx_template.shape[1], bsize
-        )
-        contact_edge_agg_idx = self._batch_edge_agg_idx(
-            self.contact_edge_agg_idx_template, self.contact_edge_idx_template.shape[1], bsize
-        )
-
         robot_inv_mass = self.robot_inv_mass.repeat(bsize, 1)
         robot_inv_inertia = self.robot_inv_inertia.repeat(bsize, 1)
         robot_cable_stiffness = self.robot_cable_stiffness.repeat(bsize, 1)
@@ -510,33 +486,10 @@ class GraphDataProcessor(BaseStateObject):
             cable_damping=robot_cable_damping,
             cable_actuated_mask=cable_act_mask,
             body_edge_idx=body_edge_idx,
-            body_edge_agg_idx=body_edge_agg_idx,
             cable_edge_idx=cable_edge_idx,
-            cable_edge_agg_idx=cable_edge_agg_idx,
             contact_edge_idx=contact_edge_idx,
-            contact_edge_agg_idx=contact_edge_agg_idx,
             body_mask=body_mask,
         )
-
-    def _batch_edge_agg_idx(self, edge_agg_idx_template, num_template_edges, bsize):
-        """Batch edge aggregation indices for multiple graphs.
-
-        Args:
-            edge_agg_idx_template: Single-graph edge aggregation indices
-            num_template_edges: Number of edges in template graph
-            bsize: Batch size
-
-        Returns:
-            [batch_size * num_nodes, max_edges_per_node] batched aggregation indices
-        """
-        edge_agg_idxs = []
-        for i in range(bsize):
-            edge_agg_idx_copy = edge_agg_idx_template.clone()
-            edge_agg_idx_copy[edge_agg_idx_copy != -1] += num_template_edges * i
-            edge_agg_idxs.append(edge_agg_idx_copy)
-
-        edge_agg_idxs = torch.vstack(edge_agg_idxs)
-        return edge_agg_idxs
 
     def batch_edge_index(self,
                          edge_index: torch.Tensor,
@@ -968,28 +921,21 @@ class GraphDataProcessor(BaseStateObject):
         return edge_index
 
     def _compute_edge_idxs(self, batch_size) \
-            -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-            torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Retrieve cached edge indices and aggregation indices for batch size.
+            -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Retrieve cached edge indices for batch size.
 
         Args:
             batch_size: Batch size to retrieve cached features for
 
         Returns:
-            Tuple of (body_edge_idx, body_edge_agg_idx, cable_edge_idx,
-                     cable_edge_agg_idx, contact_edge_idx, contact_edge_agg_idx)
+            Tuple of (body_edge_idx, cable_edge_idx, contact_edge_idx)
         """
         # Need to cache batch size before data processor call
         body_edge_idx = self._feats_batch_cache[batch_size].body_edge_idx
-        body_edge_agg_idx = self._feats_batch_cache[batch_size].body_edge_agg_idx
         cable_edge_idx = self._feats_batch_cache[batch_size].cable_edge_idx
-        cable_edge_agg_idx = self._feats_batch_cache[batch_size].cable_edge_agg_idx
         contact_edge_idx = self._feats_batch_cache[batch_size].contact_edge_idx
-        contact_edge_agg_idx = self._feats_batch_cache[batch_size].contact_edge_agg_idx
 
-        return (body_edge_idx, body_edge_agg_idx,
-                cable_edge_idx, cable_edge_agg_idx,
-                contact_edge_idx, contact_edge_agg_idx)
+        return body_edge_idx, cable_edge_idx, contact_edge_idx
 
     def _compute_body_edge_feats(self, body_edge_idx, node_pos, batch_size) -> BodyEdgeFeats:
         """Compute features for rigid body edges.
@@ -1260,10 +1206,7 @@ class GraphDataProcessor(BaseStateObject):
         )
 
         # Compute edge indices
-        edge_vals = self._compute_edge_idxs(batch_size)
-        body_edge_idx, body_edge_agg_idx = edge_vals[:2]
-        cable_edge_idx, cable_edge_agg_idx, = edge_vals[2:4]
-        contact_edge_idx, contact_edge_agg_idx = edge_vals[4:]
+        body_edge_idx, cable_edge_idx, contact_edge_idx = self._compute_edge_idxs(batch_size)
 
         # Compute edge feats
         body_edge_feats, cable_edge_feats, contact_edge_feats = self._compute_edge_feats(
@@ -1289,9 +1232,6 @@ class GraphDataProcessor(BaseStateObject):
             body_edge_attr=body_edge_attr,
             cable_edge_attr=cable_edge_attr,
             contact_edge_attr=contact_edge_attr,
-            body_edge_agg_idx=body_edge_agg_idx,
-            cable_edge_agg_idx=cable_edge_agg_idx,
-            contact_edge_agg_idx=contact_edge_agg_idx,
             contact_close_mask=contact_edge_feats.contact_close_mask,
             node_hidden_state=node_hidden_state
         )
