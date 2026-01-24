@@ -38,7 +38,7 @@ class TensegrityGNNSimulator(LearnedSimulator):
             'node_hidden_state_size': gnn_params['latent_dim'],
             'num_out_steps': self.num_out_steps,
             'num_ctrls_hist': self.num_ctrls_hist,
-            'num_sims': num_datasets
+            'num_datasets': num_datasets
         }
 
         if gnn_params['recurrent_type'] == RecurrentType.LSTM.value:

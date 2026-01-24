@@ -1,62 +1,50 @@
 import json
 import logging
-import math
-import os
 import random
 import shutil
+from collections import deque
 from copy import deepcopy
 from pathlib import Path
+from typing import Tuple
 
 import cv2
 import mujoco
 import numpy as np
 import torch
-from PIL import Image
 import tqdm
+from PIL import Image
 
 from model_predictive_control.mujoco_env import MJCTensegrityEnv
-from model_predictive_control.tensegrity_mppi import TensegrityGnnMPPI, TensegrityMjcMPPI
+from model_predictive_control.tensegrity_mppi_planner import TensegrityMPPIPlanner
 from mujoco_visualizer_utils.mujoco_visualizer import MuJoCoVisualizer
+from utilities import torch_quaternion
 
 
-class MPPIRunner:
-
+class TensegrityMJCEnvRunner:
     def __init__(self, cfg):
         self.logger = self._get_logger(cfg)
 
         self.cfg = cfg
         self.output = cfg['output']
-        self.planner_type = cfg['planner_type'] if 'planner_type' in cfg else 'gnn'
 
-        self.sim_dt = 0.01
-        self.env_dt = 0.01
-
-        self.sensor_interval = cfg['sensor_interval']
-        self.env_act_interval = int(cfg['act_interval'] / self.env_dt)
-        self.sim_act_interval = int(cfg['act_interval'] / self.sim_dt)
-        self.max_steps = cfg['max_time'] / self.env_dt
-        self.threshold = cfg['threshold']
         self.visualize = cfg['visualize']
         self.save_data = cfg['save_data']
-
-        nsamples_cold, nsamples_warm = cfg['nsamples'], cfg['nsamples'] // 2
-
         self.xml = Path(cfg['xml_path'])
         self.env_kwargs = cfg['env_kwargs']
         self.env = MJCTensegrityEnv(self.xml, env_type=cfg['env_type'], **self.env_kwargs)
 
-        if 'start' in cfg:
-            self.shift_env_robot_to_start(cfg)
+        self.planner = self._init_planner(cfg)
 
-        # Initial env robot stabilization for 5s
-        for _ in range(500):
-            self.env.step(np.zeros((1, self.env.env.n_actuators)))
-
-        self._init_planner(cfg, nsamples_cold, nsamples_warm)
-
-        self.vis, self.frames_path = None, None
+        self.vis, self.frames_path, self.vids_path = None, None, None
         if cfg['visualize']:
             self._init_visualizer(cfg)
+
+        self.shift_env_robot_to_start(cfg)
+
+        # Initial env robot stabilization for 5s
+        self.env.env.run_w_target_gaits([[1, 1, 1, 1, 1, 1]])
+        for _ in range(1000):
+            self.env.step(np.zeros((1, self.env.env.n_actuators)))
 
     def _init_visualizer(self, cfg):
         self.vis = MuJoCoVisualizer()
@@ -64,57 +52,18 @@ class MPPIRunner:
         self.vis.mjc_model.site_pos[0] = cfg['goal']
         self.vis.set_camera("top")
         self.frames_path = Path(self.output, "frames/")
+        self.vids_path = Path(self.output, "vids")
+
+        if self.frames_path.exists():
+            shutil.rmtree(self.frames_path)
+        if self.vids_path.exists():
+            shutil.rmtree(self.vids_path)
+
+        self.vids_path.mkdir(exist_ok=True)
         self.frames_path.mkdir(exist_ok=True)
-        Path(self.output, "vids").mkdir(exist_ok=True)
 
-    def _init_planner(self, cfg, nsamples_cold, nsamples_warm):
-        common_planner_kwargs = dict(
-            nsamples_cold=nsamples_cold,
-            nsamples_warm=nsamples_warm,
-            horizon=cfg['horizon'],
-            act_interval=cfg['act_interval'],
-            ctrl_interval=cfg['ctrl_interval'],
-            sensor_interval=self.sensor_interval,
-            goal=cfg['goal'],
-            obstacles=cfg['obstacles'],
-            boundaries=cfg['boundaries'],
-            logger=self.logger
-        )
-
-        if self.planner_type == 'gnn':
-            sim = torch.load(Path(cfg['model_path']), map_location='cpu', weights_only=False)
-            sim.to(cfg['device'])
-            if 'torch_compile' in cfg and cfg['torch_compile']:
-                sim.run_compile()
-
-            for c in sim.robot.actuated_cables.values():
-                c.min_length = 0.4
-                c.max_length = 2.5
-
-            start_pose = torch.tensor(self.env.env.mjc_data.qpos.reshape(-1, 7), dtype=sim.dtype)
-            start_vels = torch.zeros_like(start_pose[:, :6])
-            start_state = torch.hstack([start_pose, start_vels]).reshape(1, -1, 1)
-
-            self.planner = TensegrityGnnMPPI(
-                sim=sim,
-                curr_state=start_state,
-                dt=self.sim_dt,
-                nu=self.env.env.n_actuators,
-                **common_planner_kwargs
-            )
-            self.planner.to(cfg['device'])
-            init_endpts, _, _ = self.env.sense()
-            self.planner.set_pose_by_endpts(init_endpts)
-        elif self.planner_type == 'mujoco':
-            self.planner = TensegrityMjcMPPI(
-                xml=self.xml,
-                env_kwargs=self.env_kwargs,
-                tmp_dir=Path(self.output, "temp/"),
-                **common_planner_kwargs
-            )
-        else:
-            raise Exception(f"Planner type {self.planner_type} invalid")
-        self.planner.set_goals(np.array(cfg['goal'], dtype=np.float64))
+    def _init_planner(self, cfg):
+        pass
 
     def _get_logger(self, cfg):
         logger = logging.Logger("logger")
@@ -129,16 +78,6 @@ class MPPIRunner:
         logger.addHandler(file_handler)
 
         return logger
-
-    def shift_env_robot_to_start(self, cfg):
-        start = np.array(cfg['start']).reshape(1, 3)
-        endpts = self.env.env.get_endpts()
-        pos = self.env.env.mjc_data.qpos.reshape(-1, 7).copy()
-        com = pos[:, :3].mean(axis=0, keepdims=True)
-        pos[:, 0] -= com[:, 0] - start[:, 0]
-        pos[:, 1] -= com[:, 1] - start[:, 1]
-        pos[:, 2] = pos[:, 2] - endpts[:, 2].min() + 0.18
-        self.env.env.mjc_data.qpos = pos.flatten()
 
     def rererun(self):
         all_processed_data = json.load(Path(self.output, 'processed_data.json').open('r'))
@@ -160,147 +99,39 @@ class MPPIRunner:
                         for k in range(12)])
                    for p0, p1 in zip(all_processed_data, processed_data1)]))
 
-    def step_env(self, step, actions, sim_poses):
-        dt_ratio = int(self.sim_dt / self.env_dt)
-        # actions = (actions.transpose((0, 2, 1))
-        #            .repeat(dt_ratio, axis=2)
-        #            .reshape(actions.shape[0], -1, actions.shape[1])
-        #            .transpose((0, 2, 1)))
+    def shift_env_robot_to_start(self, cfg):
+        start, final_angle = cfg['start'][:2], cfg['start'][2]
 
-        reached_goal = False
-        poses = []
-        processed_data, extra_data = [], []
-        # sim_poses[0]['pos'] = np.concatenate(
-        #     [self.env.env.mjc_data.qpos.flatten(), sim_poses[0]['pos']])
-        sim_poses[0]['pos'] = self.env.env.mjc_data.qpos.flatten()
+        pos = self.env.env.mjc_data.qpos.reshape(-1, 7).copy()
+        com = pos[:, :3].mean(axis=0, keepdims=True)
 
-        self.env.forward()
-        for i in range(self.env_act_interval):
-            if i == self.env_act_interval - int(self.sensor_interval / self.env_dt):
-                prev_end_pts, _, _ = self.env.sense()
-                self.planner.set_pose_by_endpts(prev_end_pts)
+        end_pts = self.env.env.get_endpts()
+        left, right = end_pts[::2].mean(axis=0, keepdims=True), end_pts[1::2].mean(axis=0, keepdims=True)
+        prin = (right - left)[:, :2]
+        prin /= np.linalg.norm(prin, axis=1, keepdims=True)
+        curr_angle = torch.from_numpy(np.arctan2(prin[:, 1], prin[:, 0]).flatten())
+        rot_angle = (final_angle - curr_angle) / 2.
+        q = torch.tensor([torch.cos(rot_angle), 0., 0., torch.sin(rot_angle)]).reshape(1, 4, 1)
+        rot_pos = torch_quaternion.rotate_vec_quat(
+            q, torch.from_numpy(pos[:, :3] - com)
+        ).numpy().reshape(-1, 3)
 
-            e_data = {
-                "time": step * self.env_dt,
-                "dt": self.env_dt,
-                "rest_lengths": self.env.env.mjc_model.tendon_lengthspring[:self.planner.n_ctrls, 0].flatten().tolist(),
-                "motor_speeds": [c.motor_state.omega_t.flatten().item() for c in self.env.env.cable_motors],
-                "controls": actions[0, :, i].flatten().tolist()
-            }
-            step += 1
+        new_q = torch_quaternion.quat_prod(q, torch.from_numpy(pos[:, 3:]).reshape(-1, 4, 1)).numpy().reshape(-1, 4)
 
-            self.env.step(actions[:1, :, i].copy())
+        pos[:, 0] = rot_pos[:, 0] + start[0]
+        pos[:, 1] = rot_pos[:, 1] + start[1]
+        pos[:, 3:] = new_q
 
-            p_data = {
-                "time": step * self.env_dt,
-                "end_pts": self.env.env.get_endpts().tolist(),
-                "sites": [self.env.env.mjc_data.sensor(f"pos_{s}").data.flatten().tolist()
-                          for sp in self.env.env.cable_sites for s in sp],
-                "pos": self.env.env.mjc_data.qpos.reshape(-1, 7)[:, :3].flatten().tolist(),
-                "quat": self.env.env.mjc_data.qpos.reshape(-1, 7)[:, 3:7].flatten().tolist(),
-                "linvel": self.env.env.mjc_data.qvel.reshape(-1, 6)[:, :3].flatten().tolist(),
-                "angvel": self.env.env.mjc_data.qvel.reshape(-1, 6)[:, 3:].flatten().tolist()
-            }
+        self.env.env.mjc_data.qpos = pos.flatten()
 
-            if self.save_data:
-                processed_data.append(p_data)
-                extra_data.append(e_data)
-
-            if step % dt_ratio == 0:
-                poses.append({"time": self.sim_dt * step,
-                              "pos": self.env.env.mjc_data.qpos.copy().tolist(),
-                              })
-                idx = int((i + 1) / dt_ratio)
-                sim_poses[idx]['pos'] = np.concatenate([
-                    self.env.env.mjc_data.qpos.flatten()#, sim_poses[idx]['pos']
-                ])
-
-            mjc_state = np.hstack([
-                self.env.env.mjc_data.qpos.reshape(-1, 7),
-                self.env.env.mjc_data.qvel.reshape(-1, 6)
-            ]).reshape(1, -1, 1)
-            # cost, dir_cost = self.planner.multi_goal_dists_cost(mjc_state)
-            # multi_goal_cost, _ = self.planner.multi_goal_costs(mjc_state)
-            dist_to_goal, dir_cost = self.planner._dist_costs(mjc_state)
-            dist_to_goal = dist_to_goal ** 0.5
-            box_cost = self.planner.box_obstacle_costs(mjc_state)
-            if dist_to_goal < self.threshold:
-                reached_goal = True
-
-        self.logger.info(f"{step} {dist_to_goal.cpu().item()} {dir_cost.cpu().item()} {box_cost.cpu().item()}")
-
-        return poses, step, reached_goal, processed_data, extra_data
+    def step_env(self, num_step, action_args, **kwargs):
+        pass
 
     def plan(self, step):
-        if self.planner_type == 'gnn':
-            end_pts, rest_lens, motor_speeds = self.env.sense()
-            self.planner.reset_sim_endpts(end_pts.reshape(1, -1, 1), rest_lens, motor_speeds)
-        else:
-            state, rest_lens, motor_speeds = self.env.sense_full()
-            self.planner.reset_sim_state(state, motor_speeds, rest_lens)
-
-        mode = 'simple' if step == 0 or step % (1 * self.planner.horizon) == 0 else 'perturb'
-
-        actions, states, batch_states = self.planner.compute_actions(
-            self.planner.sim.robot.get_curr_state(),
-            rest_lens,
-            motor_speeds,
-            mode
-        )
-
-        actions = actions.cpu().clone().numpy()
-
-        return actions, states, batch_states
+        pass
 
     def run_goal(self):
-        all_extra_data, all_processed_data, poses = self._init_data()
-        step = len(poses)
-        reached_goal = False
-        frames = []
-
-        while not reached_goal and step < self.max_steps:
-            actions, states, batch_states = self.plan(step)
-            num_rods = self.planner.sim.num_bodies
-
-            batch_pos = sum([batch_states[:, i * 13: (i + 1) * 13] for i in range(num_rods)]) / num_rods
-            sim_poses = [
-                {
-                    'time': step * self.sim_dt,
-                    'pos': states[:1, :, i].reshape(-1, 13)[:, :7].flatten().cpu().clone().numpy().tolist()
-                }
-                for i in range(self.sim_act_interval + 1)
-            ]
-            prev_step = step
-            curr_poses, step, reached_goal, processed_data, extra_data = self.step_env(
-                step,
-                actions,
-                sim_poses
-            )
-
-            if self.save_data:
-                all_processed_data.extend(processed_data)
-                all_extra_data.extend(extra_data)
-
-            if self.visualize and self.vis and self.frames_path:
-                batch_pos = batch_pos.transpose(1, 2).cpu().tolist()
-                random.shuffle(batch_pos)
-                self._vis_env_data(batch_pos, frames, num_rods, prev_step, sim_poses, states)
-
-            poses.extend(curr_poses)
-            if self.visualize and (step % int(10 / self.env_dt) == 0 or reached_goal):
-                self.vis.save_video(Path(self.output, f"vids/{step}_vid.mp4"), frames)
-                frames = []
-
-            if self.save_data and (step % int(10 / self.env_dt) == 0 or reached_goal):
-                self._save_train_data(all_extra_data, all_processed_data)
-
-            if step % int(2 / self.env_dt) == 0 or reached_goal:
-                self._save_pose_data(poses)
-
-        if self.save_data:
-            self._reproduce_traj_data(all_extra_data, all_processed_data)
-
-        return poses, step
+        pass
 
     def _reproduce_traj_data(self, all_extra_data, all_processed_data):
         processed_data1, extra_data1 = self.rerun(all_processed_data[0]['pos'],
@@ -332,37 +163,17 @@ class MPPIRunner:
         else:
             raise ValueError('error too high')
 
-    def _vis_env_data(self, batch_pos, frames, num_rods, prev_step, sim_poses, states):
-        for i, pose in enumerate(sim_poses[1:]):
-            if i % 4 != 0:
-                continue
-
-            self.vis.mjc_data.qpos = pose['pos']
-            mujoco.mj_forward(self.vis.mjc_model, self.vis.mjc_data)
-            self.vis.renderer.update_scene(self.vis.mjc_data, "camera")
-            self.add_goal()
-
-            for path in batch_pos[:200]:
-                self.vis.add_path_to_scene(path[::20], radius=0.02)
-
-            path = sum([states[:1, i: i + 3] for i in range(0, 13 * num_rods, 13)]) / num_rods
-            path = path.transpose(1, 2).cpu().tolist()[0]
-            self.vis.add_path_to_scene(path[::10], radius=0.05, rgba=np.array([0., 1., 0., 1.]))
-
-            # path = sum([states[1:, i: i + 3] for i in range(0, 13 * num_rods, 13)]) / num_rods
-            # path = path.transpose(1, 2).cpu().tolist()[0]
-            # self.vis.add_path_to_scene(path[::10], radius=0.1, rgba=np.array([1., 0., 0., 1.]))
-
-            frame = self.vis.renderer.render().copy()
-            frames.append(frame)
-            Image.fromarray(frame).save(self.frames_path / f"{prev_step + i + 1}.png")
+    def _vis_env_data(self, poses, step_num, **vis_kwargs):
+        pass
 
     def add_goal(self):
         goal_arr = np.array([self.cfg['goal'], self.cfg['goal']])
-        goal_arr[1] += 0.05
-        self.vis.add_path_to_scene(goal_arr,
-                                   radius=0.4,
-                                   rgba=np.array([0.0, 0.0, 1.0, 1.0]))
+        goal_arr[1] += 0.001
+        self.vis.add_path_to_scene(
+            goal_arr,
+            radius=0.4,
+            rgba=np.array([0.0, 0.0, 1.0, 1.0])
+        )
 
     def _init_data(self):
         if 'restart' in self.cfg and self.cfg['restart']:
@@ -424,9 +235,6 @@ class MPPIRunner:
         env_copy.env.mjc_data.qpos = np.hstack([init_pos_arr, init_quat_arr]).flatten()
         env_copy.env.mjc_data.qvel = np.hstack([init_linvel_arr, init_angvel_arr]).flatten()
 
-        # init_rest = gt_extra_data[w]['rest_lengths']
-        # init_mspeeds = gt_extra_data[w]['motor_speeds']
-
         for j, cable in enumerate(env_copy.env.cable_motors):
             cable.motor_state.omega_t[:] = deepcopy(init_mspeeds[j])
         #
@@ -471,32 +279,178 @@ class MPPIRunner:
             processed_data.append(p_data)
             extra_data.append(e_data)
 
-            # tmp_poses.append(env_copy.mjc_data.qpos.reshape(1, -1).copy())
-            # tmp_vels.append(env_copy.mjc_data.qvel.reshape(1, -1).copy())
-
-        # tmp_poses = np.vstack(tmp_poses)
-        # tmp_vels = np.vstack(tmp_vels)
-        #
-        # gt_pose = np.vstack([
-        #     np.hstack([
-        #         np.array(d['pos'], np.float64).reshape(-1, 3),
-        #         np.array(d['quat'], np.float64).reshape(-1, 4)
-        #     ]).reshape(1, -1) for d in gt_processed_data[1:]
-        # ])
-        #
-        # gt_vels = np.vstack([
-        #     np.hstack([
-        #         np.array(d['linvel'], np.float64).reshape(-1, 3),
-        #         np.array(d['angvel'], np.float64).reshape(-1, 3)
-        #     ]).reshape(1, -1) for d in gt_processed_data[1:]
-        # ])
-        #
-        # error = np.abs(gt_pose - tmp_poses).max()
-        #
-        # logger.info(f'Rerun pose error: {np.abs(gt_pose - tmp_poses).max()}')
-        # logger.info(f'Rerun vels error: {np.abs(gt_vels - tmp_vels).max()}')
-
         return processed_data, extra_data
+
+
+class TensegrityMPPIRunner(TensegrityMJCEnvRunner):
+
+    def __init__(self, cfg):
+        self.env_dt = 0.01
+        self.sim_dt = 0.01
+
+        self.sensor_interval = cfg['sensor_interval']
+        self.env_act_interval = int(cfg['mppi_params']['act_interval'] / self.env_dt)
+        self.sim_act_interval = int(cfg['mppi_params']['act_interval'] / self.sim_dt)
+        self.max_steps = cfg['max_time'] / self.env_dt
+        self.tol = cfg['tol']
+
+        self.prev_pose_and_t = deque([], maxlen=20)
+
+        super().__init__(cfg)
+
+    def _init_planner(self, cfg):
+        return TensegrityMPPIPlanner(
+            obstacles=cfg['obstacles'],
+            boundary=cfg['boundary'],
+            goal=cfg['goal'],
+            grid_step=cfg['wave_grid_step'],
+            tol=cfg['tol'],
+            logger=self.logger,
+            **cfg['mppi_params']
+        )
+
+    def plan(self, step):
+        end_pts, rest_lens, motor_speeds = self.env.sense()
+        pose = self.planner.end_pts_to_pose(end_pts)
+        self.prev_pose_and_t.append((pose, step * self.env_dt))
+
+        step_type, actions, vis_data = self.planner.plan(
+            list(self.prev_pose_and_t), rest_lens, motor_speeds)
+
+        return step_type, actions, vis_data
+
+    def step_env(self, step, action_args: Tuple, **kwargs):
+        reached_goal = False
+        poses = []
+        processed_data, extra_data = [], []
+        actions = action_args[0]
+
+        self.env.forward()
+        for i in range(self.env_act_interval):
+            if (i + 1) % int(self.sensor_interval / self.env_dt) == 0:
+                prev_end_pts, _, _ = self.env.sense()
+                prev_pose = self.planner.end_pts_to_pose(prev_end_pts)
+                self.prev_pose_and_t.append((prev_pose, (step + i + 1) * self.env_dt))
+
+            e_data = {
+                "time": step * self.env_dt,
+                "dt": self.env_dt,
+                "rest_lengths": self.env.env.mjc_model.tendon_lengthspring[:self.env.env.n_actuators,
+                                0].flatten().tolist(),
+                "motor_speeds": [c.motor_state.omega_t.flatten().item() for c in self.env.env.cable_motors],
+                "controls": actions[0, :, i].flatten().tolist()
+            }
+            step += 1
+
+            self.env.step(actions[:1, :, i].copy())
+
+            p_data = {
+                "time": step * self.env_dt,
+                "end_pts": self.env.env.get_endpts().tolist(),
+                "sites": [self.env.env.mjc_data.sensor(f"pos_{s}").data.flatten().tolist()
+                          for sp in self.env.env.cable_sites for s in sp],
+                "pos": self.env.env.mjc_data.qpos.reshape(-1, 7)[:, :3].flatten().tolist(),
+                "quat": self.env.env.mjc_data.qpos.reshape(-1, 7)[:, 3:7].flatten().tolist(),
+                "linvel": self.env.env.mjc_data.qvel.reshape(-1, 6)[:, :3].flatten().tolist(),
+                "angvel": self.env.env.mjc_data.qvel.reshape(-1, 6)[:, 3:].flatten().tolist()
+            }
+
+            if self.save_data:
+                processed_data.append(p_data)
+                extra_data.append(e_data)
+
+            poses.append({
+                "time": self.sim_dt * step,
+                "pos": self.env.env.mjc_data.qpos.copy().tolist(),
+            })
+
+            mjc_state = np.hstack([
+                self.env.env.mjc_data.qpos.reshape(-1, 7),
+                self.env.env.mjc_data.qvel.reshape(-1, 6)
+            ]).reshape(1, -1, 1)
+            dist_to_goal, dir_cost = self.planner.dist_costs(mjc_state)
+            box_cost = self.planner.box_obstacle_costs(mjc_state).cpu().item()
+            if dist_to_goal < self.tol:
+                reached_goal = True
+
+        com = mjc_state.reshape(-1, 13)[:, :3].mean(axis=0).flatten()
+        self.logger.info(f"{step} {dist_to_goal.item()} {dir_cost} {box_cost} {com}")
+
+        return poses, step, reached_goal, processed_data, extra_data
+
+    def _vis_env_data(self, poses, step_num, **vis_kwargs):
+        frames = []
+        for i, pose in enumerate(poses[1:]):
+            if i % 4 != 0:
+                continue
+
+            self.vis.mjc_data.qpos = pose['pos']
+            mujoco.mj_forward(self.vis.mjc_model, self.vis.mjc_data)
+            self.vis.renderer.update_scene(self.vis.mjc_data, "camera")
+            self.add_goal()
+
+            if vis_kwargs['ctrl_type'] == 'astar':
+                self.vis.add_path_to_scene(vis_kwargs['path'], radius=0.05)
+            else:
+                for path in vis_kwargs['batch_pos'][:200]:
+                    self.vis.add_path_to_scene(path[::20], radius=0.02)
+
+                path = vis_kwargs['chosen_path']
+                self.vis.add_path_to_scene(path[::10], radius=0.05, rgba=np.array([0., 1., 0., 1.]))
+
+            frame = self.vis.renderer.render().copy()
+            frames.append(frame)
+            Image.fromarray(frame).save(self.frames_path / f"{step_num + i + 1}.png")
+
+        return frames
+
+    def run_goal(self):
+        all_extra_data, all_processed_data, poses = self._init_data()
+        step = len(poses)
+        reached_goal = False
+        frames = []
+
+        vis_step = int(10 / self.env_dt)
+        while not reached_goal and step < self.max_steps:
+            plan_output = self.plan(step)
+
+            prev_step = step
+            curr_poses, step, reached_goal, processed_data, extra_data = self.step_env(
+                step,
+                plan_output,
+            )
+
+            if self.save_data:
+                all_processed_data.extend(processed_data)
+                all_extra_data.extend(extra_data)
+
+            if self.visualize and self.vis and self.frames_path:
+                new_frames = self._vis_env_data(
+                    curr_poses,
+                    prev_step,
+                    chosen_path=plan_output[2][0],
+                    batch_pos=plan_output[2][1]
+                )
+                frames.extend(new_frames)
+
+            poses.extend(curr_poses)
+            if self.visualize and (step > vis_step or reached_goal):
+                # print(len(frames))
+                self.vis.save_video(Path(self.vids_path, f"{step}_vid.mp4"), frames)
+                frames = []
+                while vis_step < step:
+                    vis_step += int(10 / self.env_dt)
+
+            if self.save_data and (step % int(20 / self.env_dt) == 0 or reached_goal):
+                self._save_train_data(all_extra_data, all_processed_data)
+
+            if step % int(2 / self.env_dt) == 0 or reached_goal:
+                self._save_pose_data(poses)
+
+        if self.save_data:
+            self._reproduce_traj_data(all_extra_data, all_processed_data)
+
+        return poses, step
 
 
 def combine_videos(video_dir, output_path):
@@ -536,24 +490,3 @@ def combine_videos(video_dir, output_path):
         print(f"Successfully combined videos into {output_path}")
     except Exception as e:
         print(f"An error occurred: {e}")
-
-
-def run_mppi(cfg):
-    Path(cfg['output']).mkdir(exist_ok=True)
-
-    gx, gy = 0, 0
-    min_dist = 10
-    while (gx ** 2 + gy ** 2) ** 0.5 < min_dist:
-        gx = min_dist * (2 * random.random() - 1)
-        gy = min_dist * (2 * random.random() - 1)
-    cfg['goal'][0] = gx
-    cfg['goal'][1] = gy
-
-    mppi = MPPIRunner(cfg)
-
-    mppi.run_goal()
-    combine_videos(Path(cfg['output'], 'vids/'), Path(cfg['output'], 'vids/combined.mp4'))
-
-    shutil.rmtree(Path(cfg['output'], 'frames/'))
-    # os.rmdir(Path(cfg['output'], 'temp/'))
-    del mppi

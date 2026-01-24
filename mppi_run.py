@@ -9,6 +9,7 @@ from utilities.misc_utils import save_curr_code
 if __name__ == '__main__':
     # tmp()
     save_flag = True
+    torch.backends.cuda.matmul.allow_tf32 = True
     for i in range(9):
         cfg = {
             "model_path": "../../tensegrity/data_sets/tensegrity_real_datasets/"
@@ -50,10 +51,12 @@ if __name__ == '__main__':
             save_curr_code(curr_code_dir, code_output)
             save_flag = False
 
-        torch.backends.cuda.matmul.allow_tf32 = True
         with torch.no_grad():
-            run_mppi(cfg)
-        #     try:
-        #         run_mppi(cfg)
-        #     except Exception as e:
-        #         print(e)
+            mppi = TensegrityMPPIRunner(cfg)
+            mppi.run_goal()
+
+            combine_videos(Path(cfg['output'], 'vids/'), Path(cfg['output'], 'vids/combined.mp4'))
+            shutil.rmtree(Path(cfg['output'], 'frames/'))
+
+            del mppi
+

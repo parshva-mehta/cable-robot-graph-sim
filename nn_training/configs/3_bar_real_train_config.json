@@ -1,0 +1,55 @@
+{
+  "sim_config": "simulators/configs/3_bar_gnn_sim_config.json",
+  "num_steps_fwd": 1,
+  "batch_size": 128,
+  "trainable_params": [
+  ],
+  "optimizer_params": {
+    "lr": 1e-5,
+    "weight_decay": 0.01
+  },
+  "data_root": "../data_sets/tensegrity_real_datasets/",
+  "train_data_paths": [
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_ccw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_ccw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_cw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_cw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_roll_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_roll_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_ccw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_ccw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_cw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_cw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_roll_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_roll_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_ccw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_ccw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_cw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_cw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_ccw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_ccw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_cw_1",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_cw_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_roll_2",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_roll_3"
+  ],
+  "val_data_paths": [
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_ccw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_cw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_0/mjc_roll_4",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_ccw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_cw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_3/mjc_roll_4",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_ccw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_cw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_7/mjc_roll_4",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_ccw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_cw_3",
+    "mjc_6d_new_platform_real_dl_v1/dataset_9/real_roll_4"
+  ],
+  "load_sim": false,
+  "load_sim_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp2/best_rollout_model.pt",
+  "output_path": "../../tensegrity/data_sets/tensegrity_real_datasets/new_platform_models/tmp2/"
+}

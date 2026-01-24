@@ -72,7 +72,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
 
         # Load relevant constants from cfg
         self.num_ctrls_hist = self.sim_config.get('num_ctrls_hist', 1)
-        self.num_sims = training_config.get('num_sims', 10)
+        self.num_datasets = training_config.get('num_datasets', 10)
         self.dt = self.sim_config['dt']
         self.dtype = DEFAULT_DTYPE
         self.config = training_config
@@ -108,6 +108,8 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         if self.config.get('save_code', True):
             self._save_code()
 
+        self.simulator = self._get_simulator()
+
         # Load datasets and dataloaders
         self.data_root = training_config['data_root']
 
@@ -129,8 +131,6 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
             shuffle=True,
             collate_fn=self.val_dataset.collate_fn
         )
-
-        self.simulator = self._get_simulator()
 
         # Optimization params
         self.trainable_params = torch.nn.ParameterList(self.simulator.parameters())
@@ -163,8 +163,8 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         )
         self.logger.info("Computed states and controls")
 
-        data_dict['act_lengths'], data_dict['motor_omegas'] = (
-            self._get_act_lens(extra_state_infos, data_dict['times'])
+        data_dict['act_lengths'] = (
+            self._get_act_lens(extra_state_infos)
         )
         self.logger.info("Loaded act lengths and motor speeds")
 
@@ -238,15 +238,15 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
 
         return loss, pos_loss
 
-    @staticmethod
-    def _get_act_lens(extra_state_jsons, max_act_rest_lens):
+    def _get_act_lens(self, extra_state_jsons):
         data_act_lens = []
+        max_act_rest_lens = [c._rest_length for c in self.simulator.robot.actuated_cables.values()]
 
         for extra_state_json in extra_state_jsons:
             act_lens, motor_omegas = [], []
 
             for e in extra_state_json:
-                act_lengths = torch.tensor(
+                act_lengths = torch.hstack(
                     [max_act_rest_lens[i] - e['rest_lengths'][i]
                      for i in range(len(e['rest_lengths']))]
                 ).reshape(1, -1, 1)
@@ -266,7 +266,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
             sim = TensegrityGNNSimulator(
                 gnn_params=self.sim_config['gnn_params'],
                 tensegrity_cfg=self.sim_config['tensegrity_cfg'],
-                num_datasets=self.sim_config['num_sims'],
+                num_datasets=self.num_datasets,
                 num_ctrls_hist=self.sim_config['num_ctrls_hist'],
                 dt=self.sim_config['dt'],
                 cache_batch_sizes=[self.batch_size_per_step]
@@ -318,7 +318,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
                 batch['x'], batch['y'] = self.rotate_data_aug(batch['x'], batch['y'])
 
             graphs = self._batch_sim_ctrls(batch)
-            losses = self._compute_node_loss(graphs, batch['y'], self.dt)
+            node_losses = self._compute_node_loss(graphs, batch['y'], self.dt)
 
             if self.use_gt_act_lens:
                 norm_cable_loss, cable_loss = 0.0, 0.0
@@ -327,8 +327,8 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
                 cable_dls = next_act_lens - torch.concat([act_lens, next_act_lens[..., :-1]], dim=2)
                 norm_cable_loss, cable_loss = self._compute_cable_dl_loss(graphs, cable_dls)
 
-            backward_loss = losses[0] + (5 / self.num_steps_fwd) * norm_cable_loss
-            losses = [backward_loss, norm_cable_loss.detach().item(), cable_loss] + [l for l in losses[1:]]
+            backward_loss = node_losses[0] + (5 / self.num_steps_fwd) * norm_cable_loss
+            losses = [backward_loss, norm_cable_loss.detach().item(), cable_loss] + [l for l in node_losses[1:]]
 
             # If gradient updates required, run backward pass
             if grad_required:
@@ -378,7 +378,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         else:
             gt_act_lens, ctrls = None, controls.clone()
 
-        states, graphs = self.simulator.run(
+        states, graphs, _ = self.simulator.run(
             curr_state=curr_state,
             dt=self.dt,
             ctrls=ctrls,
@@ -466,7 +466,6 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
     def eval_rollout_w_ctrls(self, data_dict):
         states = data_dict['states']
         act_lengths = data_dict['act_lengths']
-        motor_omegas = data_dict['motor_omegas']
         all_controls = data_dict['controls']
         all_gt_endpts = data_dict['gt_end_pts']
         all_dataset_idxs = data_dict['dataset_idx']
@@ -481,7 +480,6 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         for i in range(len(states)):
             self.simulator.reset(
                 act_lens=act_lengths[i][0].clone().to(self.device),
-                motor_speeds=motor_omegas[i][0].clone().to(self.device)
             )
             dataset_idx = torch.tensor([[all_dataset_idxs[i]]], dtype=torch.int)
 
@@ -535,7 +533,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
 
     @staticmethod
     def rotate_data_aug(batch_x, gt_end_pts):
-        n = gt_end_pts.shape[1] // 3
+        n = gt_end_pts.shape[1] // 6
 
         angle = 2 * torch.pi * (torch.rand((batch_x.shape[0], 1, 1), device=batch_x.device) - 0.5)
         w = torch.cos(angle / 2)
@@ -825,8 +823,8 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
                         ) for j in range(num_rods)
                     ]
                 else:
-                    lin_vels = [torch.zeros_like(pos_0) for j in range(num_rods)]
-                    ang_vels = [torch.zeros_like(pos_0) for j in range(num_rods)]
+                    lin_vels = [torch.zeros_like(pos_0[j]) for j in range(num_rods)]
+                    ang_vels = [torch.zeros_like(pos_0[j]) for j in range(num_rods)]
 
                 state = torch.hstack([
                     torch.hstack([pos_1[j], quat_1[j], lin_vels[j], ang_vels[j]])
@@ -908,7 +906,7 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
 
         loss = ((pred_com - gt_com) ** 2).mean().detach().item()
         rot_loss = torch.clamp(torch.linalg.vecdot(pred_prin, gt_prin, dim=1), -0.9999999, 0.9999999)
-        mean_ang_loss = torch.rad2deg(torch.acos(rot_loss)).mean().detach()
+        mean_ang_loss = torch.rad2deg(torch.acos(rot_loss)).mean().detach().item()
 
         return loss, mean_ang_loss
 

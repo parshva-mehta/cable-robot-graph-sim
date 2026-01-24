@@ -1,14 +1,18 @@
 import json
 import logging
+import math
 import random
 from copy import deepcopy
 from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
+import torch
+import tqdm
 
 from nn_training.datasets.real_tensegrity_dataset import RealMultiSimTensegrityDataset
-from nn_training.tensegrity_gnn_training_engine import TensegrityMultiSimMultiStepMotorGNNTrainingEngine
-from simulators.tensegrity_gnn_simulator import *
+from nn_training.tensegrity_gnn_training_engine import TensegrityMultiSimMultiStepMotorGNNTrainingEngine, \
+    NUM_PRINT_STATUS_STEP
 from utilities import torch_quaternion
 
 
@@ -358,7 +362,7 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
 
         return full_traj_loss, n_step_loss, other_losses
 
-    def eval_n_step_aheads(self, n, data_dict, num_samples=1000):
+    def eval_n_step_aheads(self, n, data_dict, num_samples=500):
         trajs = data_dict['states']
         all_act_lengths = data_dict['act_lengths']
         all_controls = data_dict['controls']
@@ -388,8 +392,18 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
             ctrl_idx_starts = torch.tensor([round(times[i][idx] / self.dt) for idx in idx_starts])
             assert all_ctrls.shape[0] > max_steps
 
+            num_ctrls = len(all_controls[i])
+            ctrls_hist = [torch.zeros((1, all_controls[i][0].shape[1], 1), dtype=curr_state.dtype)
+                          for _ in range(self.num_ctrls_hist)]
+            ctrls_hist = torch.vstack(ctrls_hist + all_controls[i])
+            ctrls_hist = torch.concat([
+                ctrls_hist[j: j + num_ctrls]
+                for j in range(self.num_ctrls_hist)
+            ], dim=2)[ctrl_idx_starts].to(self.device)
+
             self.simulator.reset(
-                act_len=act_lengths[idx_starts].clone().to(self.device),
+                act_lens=act_lengths[idx_starts].clone().to(self.device),
+                ctrls_hist=ctrls_hist
             )
 
             curr_state = curr_state[idx_starts]
@@ -404,7 +418,7 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
                 act_lengths[i], all_controls[i], ctrl_idx_starts, max_steps
             )
 
-            states, _ = self.simulator.run(
+            states, _, _ = self.simulator.run(
                 curr_state=curr_state,
                 dt=self.dt,
                 ctrls=ctrls,
@@ -412,19 +426,18 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
                 state_to_graph_kwargs={'dataset_idx': dataset_idx},
             )
 
-            pred_endpts = torch.concat([self._batch_compute_end_pts(s) for s in states[min_steps - 1:]], dim=2)
+            pred_endpts = torch.concat([self.batch_compute_end_pts(s) for s in states[min_steps - 1:]], dim=2)
             pred_endpts = pred_endpts[torch.arange(curr_state.shape[0]), :, num_steps]
             pred_endpts = pred_endpts.unsqueeze(-1)
 
             gt_endpts = torch.vstack([
-                e.reshape(1, -1, 1)
+                torch.hstack(e)
                 for e in all_gt_endpts[i]
             ]).to(self.device)[idx_ends]
 
             loss = ((pred_endpts - gt_endpts) ** 2).mean().detach().item()
 
             com_loss, angle_loss = self.compute_com_and_rot_loss(pred_endpts, gt_endpts)
-            com_loss, angle_loss = com_loss.detach().item(), angle_loss.detach().item()
             total_com_loss += com_loss
             total_angle_loss += angle_loss
 
@@ -478,18 +491,19 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
                     for j in range(1, len(data_jsons[i]))]
 
             pred_endpts = torch.vstack([
-                self._batch_compute_end_pts(all_states[j])
+                self.batch_compute_end_pts(all_states[j])
                 for j in idxs
             ])
             gt_endpts = torch.vstack([
-                e.reshape(1, -1, 1)
+                torch.hstack(e)
                 for e in all_gt_endpts[i][1:]
             ]).to(self.device)
 
             loss = ((pred_endpts - gt_endpts) ** 2).mean().detach().item()
             com_loss, mean_angle_loss = self.compute_com_and_rot_loss(pred_endpts, gt_endpts)
 
-            self.logger.info(f"Eval Rollout: {data_names[i]}, "
+            self.logger.info(f"Eval Rollout: "
+                             f"{data_names[i]}, "
                              f"{loss}, "
                              f"{com_loss}, "
                              f"{mean_angle_loss}")
@@ -538,6 +552,65 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
         vel = (gt_nodes_pos[:, 3:-3] - gt_nodes_pos[:, :-6]) / self.dt
         gt_dv = p_vel - vel
         self.simulator.data_processor.normalizers['node_dv'](gt_dv)
+
+    def run_one_epoch(self,
+                      batches,
+                      grad_required=True,
+                      rot_aug=False) -> List[float]:
+        if grad_required:
+            self.simulator.train()
+        else:
+            self.simulator.eval()
+
+        total_loss, total_other_losses = 0.0, []
+        num_train, curr_batch = 0, 0
+        for batch in tqdm.tqdm(batches):
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            curr_batch += 1
+            num_train += batch['x'].shape[0]
+
+            if rot_aug:
+                batch['x'], batch['y'] = self.rotate_data_aug(batch['x'], batch['y'])
+
+            graphs = self._batch_sim_ctrls(batch)
+            node_losses = self._compute_node_loss(graphs, batch['y'], self.dt, batch['mask'])
+
+            if self.use_gt_act_lens:
+                norm_cable_loss, cable_loss = 0.0, 0.0
+            else:
+                act_lens, next_act_lens = batch['act_len'], batch['next_act_lens']
+                cable_dls = next_act_lens - torch.concat([act_lens, next_act_lens[..., :-1]], dim=2)
+                norm_cable_loss, cable_loss = self._compute_cable_dl_loss(graphs, cable_dls)
+
+            backward_loss = node_losses[0] + (5 / self.num_steps_fwd) * norm_cable_loss
+            losses = [backward_loss, norm_cable_loss.detach().item(), cable_loss] + [l for l in node_losses[1:]]
+
+            # If gradient updates required, run backward pass
+            if grad_required:
+                self._backward(backward_loss)
+
+            total_loss += losses[0].detach().item() * batch['x'].shape[0]
+            total_other_losses.append([
+                l * batch['x'].shape[0] for l in losses[1:]
+            ])
+
+            if curr_batch % NUM_PRINT_STATUS_STEP == 0:
+                avg_other_losses = [
+                    sum(l) / num_train
+                    for l in zip(*total_other_losses)
+                ]
+                print(total_loss / num_train, avg_other_losses)
+
+        total_loss /= num_train
+        avg_other_losses = [
+            sum(l) / num_train
+            for l in zip(*total_other_losses)
+        ]
+
+        losses = [total_loss] + avg_other_losses
+
+        return losses
 
     def _compute_node_loss(self, graphs, gt_end_pts, dt, mask=None):
         def reshape_node_pos_tensor(pos):

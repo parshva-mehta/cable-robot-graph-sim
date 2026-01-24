@@ -85,14 +85,12 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
         all_ctrls, all_act_lens = (
             raw_data_dict["controls"], raw_data_dict["act_lengths"])
 
-        all_motor_omegas = raw_data_dict["motor_omegas"]
-
         for i in range(len(all_states)):
-            states, times, end_pts = all_states[i], all_times[i], all_end_pts[i]
+            states, times = all_states[i], all_times[i]
             controls, act_lengths = all_ctrls[i], [torch.hstack(a) for a in all_act_lens[i]]
             dataset_idx = torch.tensor([[raw_data_dict['dataset_idx'][i]]], dtype=torch.int)
 
-            motor_omegas = all_motor_omegas[i]
+            end_pts = torch.vstack([torch.hstack(e) for e in all_end_pts[i]])
 
             traj_ctrls_hist = self._get_ctrls_hist(controls)
 
@@ -121,7 +119,6 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                 idx0 = round(t0 / self.dt)
                 idx1 = round(t1 / self.dt)
                 act_lens = act_lengths[idx0]
-                motor_speed = motor_omegas[idx0]
                 ctrls = torch.cat(controls[idx0:idx1], dim=2)
                 ctrls_hist = traj_ctrls_hist[idx0]
                 next_act_lens = torch.concat(act_lengths[idx0 + 1: idx1 + 1], dim=2)
@@ -136,8 +133,7 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                     'next_act_lens': next_act_lens,
                     'delta_t': torch.tensor([[[delta_t]]], dtype=self.dtype),
                     'dataset_idx': dataset_idx.clone(),
-                    'mask': mask,
-                    'motor_omega': motor_speed
+                    'mask': mask
                 }
                 processed_data.append(processed_instance)
 
@@ -175,6 +171,9 @@ class RealMultiSimTensegrityDataset(TensegrityDataset):
                 b['mask'] = torch.cat([mask, mask_pad], dim=-1)
                 b['y'] = torch.cat([y, y_pad], dim=-1)
 
-        collated_batch_dict = super().collate_fn(batch)
+        collated_batch_dict = {
+            k: torch.vstack([d[k] for d in batch])
+            for k in batch[0].keys()
+        }
 
         return collated_batch_dict

@@ -25,9 +25,13 @@ mv {DOWNLOAD_DIR}/ ./
 unzip 
 ```
 
-## Train Model
+## Train model with simulation data only
 
-``python3 train.py``
+``python3 train_sim_data.py``
+
+## Train model with simulation and real data
+
+``python3 train_real_data.py``
 
 ## Eval model
 
@@ -36,7 +40,7 @@ unzip
 ## Modifying config files for your own experiments
 
 There are two config json files relevant for simulation and training:
-1. `training/configs/*`    <--- json files that control training related parameters/settings
+1. `nn_training/configs/*`    <--- json files that control training related parameters/settings
 2. `simulators/configs/*`   <--- json files that specify simulation and robot parameters and configuration
 
 

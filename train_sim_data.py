@@ -5,13 +5,14 @@ from nn_training.tensegrity_gnn_training_engine import *
 from utilities.misc_utils import setup_logger
 
 
-def train():
-    torch.autograd.set_detect_anomaly(False)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch._dynamo.config.cache_size_limit = 512
-    np.set_printoptions(precision=64)
+torch.autograd.set_detect_anomaly(False)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch._dynamo.config.cache_size_limit = 512
+np.set_printoptions(precision=64)
 
-    config_file_path = "nn_training/configs/cotrain_new_3_bar_train_config.json"
+
+def train():
+    config_file_path = "nn_training/configs/3_bar_sim_train_config.json"
     with open(config_file_path, 'r') as j:
         cfg = json.load(j)
     Path(cfg['output_path']).mkdir(parents=True, exist_ok=True)

@@ -28,7 +28,7 @@ class TensegrityDataset(Dataset):
         data_gt_end_pts = raw_data_dict["gt_end_pts"]
 
         for i in tqdm.tqdm(range(len(raw_data_dict['states'])), desc='Loading torch dataset'):
-            dataset_idx = raw_data_dict['dataset_idx'][i]
+            dataset_idx = torch.tensor([raw_data_dict['dataset_idx'][i]])
             controls = torch.vstack(raw_data_dict['controls'][i])
 
             end = controls.shape[0] if self.num_steps_fwd == 1 else -self.num_steps_fwd + 1
@@ -38,7 +38,6 @@ class TensegrityDataset(Dataset):
                               ] + all_ctrls_hist
 
             act_lengths = raw_data_dict['act_lengths'][i][:-self.num_steps_fwd]
-            motor_omegas = raw_data_dict['motor_omegas'][i][:-self.num_steps_fwd]
             x = raw_data_dict['states'][i][:-self.num_steps_fwd]
 
             gt_end_pts = torch.vstack([torch.hstack(d) for d in data_gt_end_pts[i]])
@@ -47,8 +46,6 @@ class TensegrityDataset(Dataset):
             traj_x = [torch.concat(x[j: j + 1], 2) for j in range(len(x))]
             traj_act_lens = [torch.concat(act_lengths[j: j + 1], 2)
                              for j in range(len(act_lengths))]
-            traj_motor_speeds = [torch.concat(motor_omegas[j: j + 1], 2)
-                                 for j in range(len(motor_omegas))]
             traj_ctrls_hist = [torch.concat(all_ctrls_hist[j - self.num_ctrls_hist: j], 2)
                                if self.num_ctrls_hist > 0 else torch.empty(all_ctrls_hist[0].shape)
                                for j in range(self.num_ctrls_hist, len(all_ctrls_hist))]
@@ -76,8 +73,8 @@ class TensegrityDataset(Dataset):
 
             traj_elms = zip(traj_x, traj_y, traj_dt, traj_ctrls,
                             traj_act_lens, traj_next_act_lens,
-                            traj_motor_speeds, traj_ctrls_hist)
-            for x, y, dt, ctrl, act_len, next_act_lens, motor_omega, ctrls_hist in traj_elms:
+                            traj_ctrls_hist)
+            for x, y, dt, ctrl, act_len, next_act_lens, ctrls_hist in traj_elms:
                 delta_t = compute_num_steps(dt, self.dt) * self.dt
 
                 data_instance = {
@@ -87,7 +84,6 @@ class TensegrityDataset(Dataset):
                     'dt': torch.tensor([[[dt]]], dtype=self.dtype),
                     'act_len': act_len,
                     'next_act_lens': next_act_lens,
-                    'motor_omega': motor_omega,
                     'delta_t': torch.tensor([[[delta_t]]], dtype=self.dtype),
                     'ctrls_hist': ctrls_hist,
                     'dataset_idx': dataset_idx,
