@@ -12,6 +12,17 @@ class PID(BaseStateObject):
                  min_length=100,
                  RANGE=100,
                  tol=0.15):
+        """
+        Initialize the PID controller.
+
+        Args:
+            k_p: Proportional gain coefficient (default: 6.0)
+            k_i: Integral gain coefficient (default: 0.01)
+            k_d: Derivative gain coefficient (default: 0.5)
+            min_length: Minimum cable length in original units (default: 100)
+            RANGE: Operating range of cable length in original units (default: 100)
+            tol: Error tolerance for considering target reached (default: 0.15)
+        """
         super().__init__('pid')
         # self.last_control = np.zeros(n_motor)
         self.last_error = None
@@ -26,7 +37,8 @@ class PID(BaseStateObject):
         self.RIGHT_RANGE = None
         self.done = None
 
-    def move_tensors(self, device):
+    def to(self, device):
+        super().to(device)
         if self.last_error is not None:
             self.last_error = self.last_error.to(device)
 
@@ -35,29 +47,28 @@ class PID(BaseStateObject):
 
         return self
 
-    def update_control_target_length(self, current_length, target_length):
-        if self.cum_error is None:
-            self.cum_error = zeros(current_length.shape, ref_tensor=current_length)
-
-        u = zeros(current_length.shape, ref_tensor=current_length)
-        RANGE = 1.0
-        diff = current_length - target_length
-        error = diff / RANGE
-
-        high_error = torch.abs(error) >= 0.05
-        d_error = zeros(current_length.shape, ref_tensor=current_length) \
-            if self.last_error is None else error - self.last_error
-        self.cum_error += error
-        self.last_error = error
-
-        u[high_error] = (self.k_p * error[high_error]
-                         + self.k_i * self.cum_error[high_error]
-                         + self.k_d * d_error[high_error])
-        u = torch.clip(u, min=-1, max=1)
-
-        return u
-
     def update_control_by_target_gait(self, current_length, target_gait, rest_length):
+        """Compute PID control signal to track target gait position.
+
+        This method calculates the control input needed to move cables from their
+        current length to the target gait position. It uses PID control with error
+        tracking and includes logic to detect when targets are reached.
+
+        Args:
+            current_length: Current cable lengths tensor
+            target_gait: Target normalized positions (0-1 range)
+            rest_length: Natural/rest length of cables
+
+        Returns:
+            tuple: (u, position) where:
+                - u: Control signal tensor, clipped to [-1, 1]
+                - position: Normalized current position (0-1 range)
+
+        Note:
+            - Control is set to 0 for cables marked as 'done' (within tolerance)
+            - Prevents slack by setting control to 0 when cable is shorter than
+              rest length and control would further shorten it
+        """
         if self.done is None:
             self.done = torch.tensor([False] * current_length.shape[0],
                                      device=current_length.device)
@@ -74,8 +85,8 @@ class PID(BaseStateObject):
 
         position = (current_length - min_length) / range_
 
-        # if self.done:
-        #     return u, position
+        if self.done:
+            return u, position
 
         target_length = min_length + range_ * target_gait
         error = position - target_gait
@@ -101,66 +112,17 @@ class PID(BaseStateObject):
                          + self.k_d * d_error[~low_error])
 
         u = torch.clip(u, min=-1, max=1)
-
-        slack = torch.logical_and(current_length < rest_length,
-                                  u < 0)
+        slack = torch.logical_and(current_length < rest_length, u < 0)
         u[slack] = 0
 
         return u, position
 
-    def compute_ctrl_target_gait(self,
-                                 position,
-                                 min_length,
-                                 range_,
-                                 target_gait,
-                                 ):
-        u = zeros(position.shape, ref_tensor=position)
-
-        if self.done:
-            return u
-
-        target_length = min_length + range_ * target_gait
-        current_length = min_length + range_ * position
-        error = position - target_gait
-
-        low_error = (abs(error) < self.tol
-                     or abs(current_length - target_length) < 0.1
-                     or (target_gait == 0 and position < 0))
-
-        if low_error.all():
-            self.done = True
-
-        if self.cum_error is None:
-            self.cum_error = zeros(current_length.shape,
-                                   ref_tensor=current_length)
-
-        d_error = zeros(error.shape, ref_tensor=error) \
-            if self.last_error is None else error - self.last_error
-        self.cum_error += error
-        self.last_error = error
-        try:
-            u[~low_error] = (self.k_p * error[~low_error]
-                             + self.k_i * self.cum_error[~low_error]
-                             + self.k_d * d_error[~low_error])
-        except:
-            ignore = 0
-
-        u = torch.clip(u, min=-1, max=1)
-
-        if u.all() == 0.0:
-            self.done = True
-
-        return u
-
     def reset(self):
+        """Reset controller state to initial conditions.
+
+        Clears error history, cumulative error, and done flags. Should be called
+        between episodes or when starting a new control sequence.
+        """
         self.last_error = None
         self.cum_error = None
         self.done = None
-
-    def set_range(self, RANGE):
-        self.LEFT_RANGE = RANGE[0] / 100.
-        self.RIGHT_RANGE = RANGE[1] / 100.
-        # self.RANGE = RANGE / 100.
-
-    def set_min_length(self, min_length):
-        self.min_length = min_length / 100.

@@ -1,3 +1,9 @@
+"""Graph data processor for tensegrity robot GNN physics simulation.
+
+This module handles the conversion of robot states into graph-structured data
+suitable for GNN-based physics prediction. It manages node and edge features,
+normalization, and batching for efficient training and inference.
+"""
 from enum import Enum
 from typing import List, Tuple, Union, NamedTuple, Dict
 
@@ -13,6 +19,11 @@ from utilities.tensor_utils import zeros, safe_norm
 
 
 class NodeFeats(NamedTuple):
+    """Node feature container for graph nodes.
+
+    Stores all features associated with graph nodes including velocities,
+    mass properties, spatial relationships, and simulation metadata.
+    """
     node_vel: torch.Tensor
     node_inv_mass: torch.Tensor
     node_inv_inertia: torch.Tensor
@@ -30,6 +41,11 @@ class NodeFeats(NamedTuple):
 
 
 class BodyEdgeFeats(NamedTuple):
+    """Edge features for rigid body connections.
+
+    Contains distance and rest length information for edges connecting
+    nodes within the same rigid body.
+    """
     body_dist: torch.Tensor
     body_dist_norm: torch.Tensor
     body_rest_dist: torch.Tensor
@@ -37,6 +53,11 @@ class BodyEdgeFeats(NamedTuple):
 
 
 class CableEdgeFeats(NamedTuple):
+    """Edge features for cable connections.
+
+    Stores cable-specific features including distances, velocities, stiffness,
+    damping, control signals, and actuation status.
+    """
     cable_dist: torch.Tensor
     cable_dist_norm: torch.Tensor
     cable_dir: torch.Tensor
@@ -49,6 +70,11 @@ class CableEdgeFeats(NamedTuple):
 
 
 class ContactEdgeFeats(NamedTuple):
+    """Edge features for ground contact interactions.
+
+    Contains contact geometry, velocities, and proximity information for
+    edges between robot nodes and ground.
+    """
     contact_dist: torch.Tensor
     contact_normal: torch.Tensor
     contact_tangent: torch.Tensor
@@ -58,6 +84,11 @@ class ContactEdgeFeats(NamedTuple):
 
 
 class CacheableFeats(NamedTuple):
+    """Container for features that can be precomputed and cached.
+
+    Stores batch-size-specific features that remain constant during simulation
+    and can be cached for performance optimization.
+    """
     node_inv_mass: torch.Tensor
     node_inv_inertia: torch.Tensor
     node_body_verts: torch.Tensor
@@ -77,6 +108,11 @@ class CacheableFeats(NamedTuple):
 
 
 class GraphFeats(NamedTuple):
+    """Complete graph feature set ready for GNN processing.
+
+    Contains all normalized node features, edge features, edge indices,
+    and aggregation indices needed for graph neural network forward pass.
+    """
     node_x: torch.Tensor
     body_edge_attr: torch.Tensor
     body_edge_idx: torch.Tensor
@@ -92,6 +128,11 @@ class GraphFeats(NamedTuple):
 
 
 class PredGnnAttrs(NamedTuple):
+    """GNN prediction outputs and intermediate values.
+
+    Stores predicted positions, velocities, and various delta-velocity
+    representations used during training and evaluation.
+    """
     pos: torch.Tensor
     vel: torch.Tensor
     p_pos: torch.Tensor
@@ -104,11 +145,26 @@ class PredGnnAttrs(NamedTuple):
 
 
 class CableInputType(Enum):
+    """Enum defining how cable actuation is represented in the graph.
+
+    REST_LENS: Cable actuation encoded as target rest lengths
+    CTRLS: Cable actuation encoded as control signals
+    """
     REST_LENS = 'rest_lens'
     CTRLS = 'ctrls'
 
 
 class GraphDataProcessor(BaseStateObject):
+    """Processes tensegrity robot states into graph-structured data for GNN physics prediction.
+
+    This class handles the complex transformation from SE(3) robot states to graph representations
+    suitable for graph neural networks. It manages:
+    - Node feature computation (mass, inertia, velocities, spatial relationships)
+    - Edge feature computation (body, cable, and contact edges)
+    - Feature normalization for stable training
+    - Batch processing and caching for performance
+    - Conversion between pose representations and node positions
+    """
     robot: TensegrityRobotGNN
     MAX_DIST_TO_GRND: float
     CONTACT_EDGE_THRESHOLD: float
@@ -137,15 +193,21 @@ class GraphDataProcessor(BaseStateObject):
                  node_hidden_state_size: int = 1024,
                  num_ctrls_hist: int = 2,
                  cable_input_type: CableInputType = CableInputType.CTRLS):
+        """Initialize the graph data processor.
+
+        Args:
+            tensegrity: TensegrityRobotGNN instance defining robot structure
+            con_edge_threshold: Distance threshold (m) for creating ground contact edges
+            num_out_steps: Number of future timesteps to predict
+            dt: Simulation timestep size (seconds)
+            max_dist_to_grnd: Maximum distance to ground for feature clipping (m)
+            cache_batch_sizes: List of batch sizes to precompute and cache
+            num_datasets: Number of different datasets for one-hot encoding
+            node_hidden_state_size: Dimension of node hidden state vectors
+            num_ctrls_hist: Number of historical control steps to include
+            cable_input_type: How cable actuation is encoded (REST_LENS or CTRLS)
+        """
         super().__init__('graph data processor')
-        """
-        @param tensegrity: robot object
-        @param con_edge_threshold: threshold to attach edge between ground and endcap node
-        @param num_steps_ahead: how many steps training traj will be
-        @param num_hist: how many steps behind to attach to features
-        @param dt: timestep size
-        @param max_dist_to_grnd: clip value for dist to ground feature
-        """
         with torch.no_grad():
             self.MAX_DIST_TO_GRND = max_dist_to_grnd
             self.CONTACT_EDGE_THRESHOLD = con_edge_threshold
@@ -312,6 +374,14 @@ class GraphDataProcessor(BaseStateObject):
                 self.precompute_and_cache_batch_sizes(cache_batch_sizes)
 
     def to(self, device: Union[str, torch.device]):
+        """Move all tensors and sub-objects to specified device.
+
+        Args:
+            device: Target device (e.g., 'cpu', 'cuda', or torch.device)
+
+        Returns:
+            Self for method chaining
+        """
         super().to(device)
         self.robot.to(device)
         self.dt = self.dt.to(device)
@@ -350,40 +420,56 @@ class GraphDataProcessor(BaseStateObject):
 
     @property
     def cached_batch_size_keys(self):
+        """Get list of batch sizes that have been precomputed and cached.
+
+        Returns:
+            List of integer batch sizes available in cache
+        """
         return list(self._feats_batch_cache.keys())
 
     def precompute_and_cache_batch_sizes(self, batch_sizes, overwrite=False):
+        """Precompute and cache features for specific batch sizes.
+
+        This optimization avoids recomputing static features during training.
+
+        Args:
+            batch_sizes: List of batch sizes to precompute
+            overwrite: If True, recompute even if already cached
+        """
         for bsize in batch_sizes:
             if overwrite or bsize not in self._feats_batch_cache:
                 self._feats_batch_cache[bsize] = self._batch_feats(bsize)
 
     def start_normalizers(self):
-        """
-        Set accumulation flag of all normalizers to true
+        """Start accumulating statistics in all feature normalizers.
+
+        Call this at the beginning of a training data collection phase to
+        gather mean and standard deviation statistics for normalization.
         """
         for normalizer in self.normalizers.values():
             normalizer.start_accum()
 
     def stop_normalizers(self):
-        """
-        Set accumulation flag of all normalizers to talse
+        """Stop accumulating statistics in all feature normalizers.
+
+        Call this after collecting training data to finalize normalization
+        parameters before training begins.
         """
         for normalizer in self.normalizers.values():
             normalizer.stop_accum()
 
-    def _build_csr_agg_mat(self, edge_index, num_nodes):
-        node_idx = edge_index[1:]
-        edge_attr_idx = torch.arange(node_idx.shape[1]).reshape(1, -1).to(edge_index.device)
-        mat_indices = torch.vstack([node_idx, edge_attr_idx])
-        vals = torch.ones(mat_indices.shape[1], device=node_idx.device)
-
-        agg_mat = torch.sparse_coo_tensor(
-            mat_indices, vals, (num_nodes, node_idx.shape[1]), device=node_idx.device
-        ).coalesce().to_sparse_csr()
-
-        return agg_mat
-
     def _batch_feats(self, bsize: int):
+        """Precompute batch-size-specific features for caching.
+
+        Creates batched versions of static features (mass, inertia, edge indices)
+        that don't change during simulation.
+
+        Args:
+            bsize: Batch size to precompute for
+
+        Returns:
+            CacheableFeats containing all batch-size-specific features
+        """
         nnodes = self.contact_edge_idx_template.max() + 1
         body_edge_idx = self.batch_edge_index(self.body_edge_idx_template, bsize, nnodes)
         cable_edge_idx = self.batch_edge_index(self.cable_edge_idx_template, bsize, nnodes)
@@ -432,20 +518,17 @@ class GraphDataProcessor(BaseStateObject):
             body_mask=body_mask,
         )
 
-    def _compute_edge_agg_idx(self, edge_idx_template, template_max_node):
-        edge_agg_idx = [[] for _ in range(template_max_node)]
-        for i in range(edge_idx_template.shape[1]):
-            edge_agg_idx[edge_idx_template[1, i]].append(i)
-
-        max_len = max([len(e) for e in edge_agg_idx])
-        for i in range(len(edge_agg_idx)):
-            if len(edge_agg_idx[i]) < max_len:
-                edge_agg_idx[i] = edge_agg_idx[i] + [-1] * (max_len - len(edge_agg_idx[i]))
-
-        edge_agg_idx = torch.tensor(edge_agg_idx, dtype=torch.int, device=edge_idx_template.device)
-        return edge_agg_idx
-
     def _batch_edge_agg_idx(self, edge_agg_idx_template, num_template_edges, bsize):
+        """Batch edge aggregation indices for multiple graphs.
+
+        Args:
+            edge_agg_idx_template: Single-graph edge aggregation indices
+            num_template_edges: Number of edges in template graph
+            bsize: Batch size
+
+        Returns:
+            [batch_size * num_nodes, max_edges_per_node] batched aggregation indices
+        """
         edge_agg_idxs = []
         for i in range(bsize):
             edge_agg_idx_copy = edge_agg_idx_template.clone()
@@ -460,14 +543,17 @@ class GraphDataProcessor(BaseStateObject):
                          batch_size: int,
                          num_nodes: torch.Tensor,
                          ) -> torch.Tensor:
-        """
-        Expand edge indices from one graph to a batch of graphs. Method assumes
-        same size and connections
+        """Expand edge indices from single graph to batch of graphs.
 
-        @param senders: indices of starting nodes
-        @param receivers: indices of ending nodes
-        @param batch_size: int
-        @return:
+        Assumes all graphs in batch have identical topology (same size and connections).
+
+        Args:
+            edge_index: [2, num_edges] edge connectivity for single graph
+            batch_size: Number of graphs in batch
+            num_nodes: Number of nodes per graph
+
+        Returns:
+            [2, batch_size * num_edges] batched edge indices
         """
         # Assume graphs are the same size and have the same connections
         senders = edge_index[:1].repeat(batch_size, 1)
@@ -490,13 +576,19 @@ class GraphDataProcessor(BaseStateObject):
                   prev_node_pos: torch.Tensor,
                   num_nodes: int,
                   **kwargs):
-        """
-        Method to map node poses to SE(3) poses
+        """Convert node positions to SE(3) rigid body poses.
 
-        @param node_pos: (batch_size * num nodes per graph, 3 * num_hist)
-        @param prev_node_pos: (batch_size * num nodes per graph, 3 * num_hist)
-        @param num_nodes: num nodes per rod
-        @return: torch tensor of SE(3) poses
+        Computes center of mass position, orientation quaternion, linear velocity,
+        and angular velocity from node positions.
+
+        Args:
+            node_pos: [batch_size * num_nodes, 3] current node positions
+            prev_node_pos: [batch_size * num_nodes, 3] previous node positions
+            num_nodes: Number of nodes per rigid body
+
+        Returns:
+            [batch_size, 13 * num_rods, num_timesteps] SE(3) state tensor
+            Format: [pos(3), quat(4), lin_vel(3), ang_vel(3)] per rod
         """
 
         def compute_state(node_pos, prev_node_pos):
@@ -541,6 +633,15 @@ class GraphDataProcessor(BaseStateObject):
         return states
 
     def _normalize_and_hstack(self, raw_feats, feat_dict):
+        """Normalize and concatenate features according to feature dictionary.
+
+        Args:
+            raw_feats: NamedTuple containing raw feature tensors
+            feat_dict: Dictionary mapping feature names to dimensions
+
+        Returns:
+            Concatenated normalized feature tensor
+        """
         feats_list = [
             self.normalizers[k](getattr(raw_feats, k))
             for k in feat_dict.keys()
@@ -555,11 +656,20 @@ class GraphDataProcessor(BaseStateObject):
             cable_edge_feats: CableEdgeFeats,
             contact_edge_feats: ContactEdgeFeats
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Normalize and concat all node and edge feats to form input feat vectors
+        """Normalize and concatenate all features for GNN input.
 
-        @param graph: graph data object with raw features
-        @return: graph filled with node and edge feats
+        Applies learned normalization (mean/std) to each feature type and
+        concatenates them into single tensors per feature type.
+
+        Args:
+            node_raw_feats: Raw node features
+            body_edge_feats: Raw body edge features
+            cable_edge_feats: Raw cable edge features
+            contact_edge_feats: Raw contact edge features
+
+        Returns:
+            Tuple of (node_x, body_edge_attr, cable_edge_attr, contact_edge_attr)
+            All features normalized and concatenated
         """
         node_x = self._normalize_and_hstack(
             node_raw_feats, self.node_feat_dict
@@ -577,6 +687,17 @@ class GraphDataProcessor(BaseStateObject):
         return node_x, body_edge_attr, cable_edge_attr, contact_edge_attr
 
     def _inject_grnd_feat(self, feat, grnd_val_tensor):
+        """Add ground node feature to batched node features.
+
+        Appends ground node feature values to the end of each graph's node features.
+
+        Args:
+            feat: [batch_size * num_robot_nodes, feat_dim] node features
+            grnd_val_tensor: [1, feat_dim] ground node feature value
+
+        Returns:
+            [batch_size * (num_robot_nodes + 1), feat_dim] features with ground
+        """
         num_nodes = self.robot.num_nodes
         hsize = feat.shape[1]
 
@@ -592,10 +713,18 @@ class GraphDataProcessor(BaseStateObject):
                   batch_size: int,
                   augment_grnd=False,
                   ) -> torch.Tensor:
-        """
-        SE(3) pose to 3D node poses
-        @param pose: (batch size * num rods, 7)
-        @return: tensor (batch_size * num nodes per graph, 3)
+        """Convert SE(3) rigid body poses to 3D node positions.
+
+        Transforms body-frame node positions to world frame using position and orientation.
+
+        Args:
+            pos: [batch_size * num_rods, 3, 1] body positions
+            quat: [batch_size * num_rods, 4, 1] body orientations (quaternions)
+            batch_size: Number of graphs in batch
+            augment_grnd: If True, append ground node at origin
+
+        Returns:
+            [batch_size * num_nodes, 3] world-frame node positions
         """
         # Get positions of nodes in body frame
         body_verts = torch.vstack(
@@ -615,6 +744,15 @@ class GraphDataProcessor(BaseStateObject):
         return node_pos
 
     def _get_body_verts(self, batch_size, device):
+        """Get batched body-frame vertex positions.
+
+        Args:
+            batch_size: Number of graphs in batch
+            device: Target device for tensors
+
+        Returns:
+            [batch_size * num_rods, 3, num_verts] body-frame vertices
+        """
         body_verts = (self.robot.body_verts
                       .to(device)
                       .transpose(0, 2)
@@ -622,8 +760,19 @@ class GraphDataProcessor(BaseStateObject):
         return body_verts
 
     def _compute_shape_feats(self, node_pos, batch_size):
-        """
-        Assume no ground node in node_pos yet
+        """Compute shape-based features relative to robot frame.
+
+        Calculates node positions in a robot-local coordinate frame defined by
+        first and last nodes. Assumes no ground node in input.
+
+        Args:
+            node_pos: [batch_size * num_nodes, 3] node positions
+            batch_size: Number of graphs in batch
+
+        Returns:
+            Tuple of (dist_first_node, dist_first_node_norm):
+                - dist_first_node: [num_nodes, 3] position in robot frame
+                - dist_first_node_norm: [num_nodes, 1] distance magnitude
         """
         num_nodes = node_pos.shape[0] // batch_size
 
@@ -652,6 +801,16 @@ class GraphDataProcessor(BaseStateObject):
         return dist_first_node, dist_first_node_norm
 
     def _compute_prin_feat(self, node_pos):
+        """Compute principal axis direction for each rigid body.
+
+        Principal axis is the normalized vector from sphere0 to sphere1 of each rod.
+
+        Args:
+            node_pos: [batch_size * num_nodes, 3] node positions
+
+        Returns:
+            [batch_size * num_nodes, 3] principal axis direction per node (replicated)
+        """
         num_nodes, num_nodes_per_rod = self.robot.num_nodes, self.robot.num_nodes_per_rod
 
         node_pos_ = node_pos.reshape(-1, 3 * num_nodes_per_rod)
@@ -669,13 +828,20 @@ class GraphDataProcessor(BaseStateObject):
                             batch_pos: torch.Tensor,
                             **kwargs
                             ) -> NodeFeats:
-        """
-        Method to compute all node feats based on curr and prev node poses
+        """Compute all node features from current and previous positions.
 
-        @param node_pos: (batch_size * num nodes per graph, 3 * num_hist)
-        @param prev_node_pos: (batch_size * num nodes per graph, 3 * num_hist)
-        @param batch_size: size of batch
-        @return: Dictionary of feat tensors
+        Calculates velocities, spatial relationships, mass properties, and geometric
+        features. Adds ground node features at the end.
+
+        Args:
+            node_pos: [batch_size * num_nodes, 3] current positions
+            prev_node_pos: [batch_size * num_nodes, 3] previous positions
+            batch_size: Number of graphs in batch
+            batch_pos: [batch_size * num_rods, 3] center of mass positions
+            **kwargs: Must contain 'dataset_idx' for one-hot encoding
+
+        Returns:
+            NodeFeats containing all computed node features
         """
 
         # Pre adding ground node
@@ -732,6 +898,16 @@ class GraphDataProcessor(BaseStateObject):
         return node_feats
 
     def _one_hot_encode(self, batch_idxs):
+        """Create one-hot encoding for dataset indices.
+
+        Used to indicate which dataset each sample comes from in multi-dataset training.
+
+        Args:
+            batch_idxs: [batch_size, 1] dataset indices
+
+        Returns:
+            [batch_size * num_nodes, num_datasets] one-hot encoded vectors
+        """
         num_nodes = self.robot.num_nodes + 1
         batch_idxs = batch_idxs.repeat(1, num_nodes).reshape(-1, 1)
         vecs = torch.zeros(
@@ -744,9 +920,10 @@ class GraphDataProcessor(BaseStateObject):
         return vecs
 
     def _body_edge_index(self) -> torch.Tensor:
-        """
-        Get
-        @return:
+        """Get edge indices for rigid body connections.
+
+        Returns:
+            [2, num_body_edges] edge connectivity for body structure
         """
         senders = self.robot.template_idx[:1].to(self.device)
         receivers = self.robot.template_idx[1:].to(self.device)
@@ -756,17 +933,25 @@ class GraphDataProcessor(BaseStateObject):
         return edge_index
 
     def _get_cable_edge_idxs(self) -> torch.Tensor:
+        """Get edge indices for cable connections.
+
+        Returns:
+            [2, num_cable_edges] edge connectivity for cables
+        """
         return self.robot.get_cable_edge_idxs().to(self.device)
 
     def _contact_edge_index(self,
                             grnd_idx: int
                             ) -> torch.Tensor:
-        """
-        Method to get contact edge indices
+        """Get bidirectional edge indices for ground contact.
 
-        @param contact_node_idxs: indices of nodes that are involved in contact events
-        @param grnd_idx: index of ground in non-batched graph
-        @return:
+        Creates edges connecting contact-capable nodes to ground node in both directions.
+
+        Args:
+            grnd_idx: Index of ground node in graph
+
+        Returns:
+            [2, 2 * num_contact_nodes] bidirectional contact edge connectivity
         """
         senders = torch.tensor([self.robot.get_contact_nodes()],
                                dtype=torch.int,
@@ -785,8 +970,14 @@ class GraphDataProcessor(BaseStateObject):
     def _compute_edge_idxs(self, batch_size) \
             -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
             torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Method to compute different edge type indices
+        """Retrieve cached edge indices and aggregation indices for batch size.
+
+        Args:
+            batch_size: Batch size to retrieve cached features for
+
+        Returns:
+            Tuple of (body_edge_idx, body_edge_agg_idx, cable_edge_idx,
+                     cable_edge_agg_idx, contact_edge_idx, contact_edge_agg_idx)
         """
         # Need to cache batch size before data processor call
         body_edge_idx = self._feats_batch_cache[batch_size].body_edge_idx
@@ -801,6 +992,16 @@ class GraphDataProcessor(BaseStateObject):
                 contact_edge_idx, contact_edge_agg_idx)
 
     def _compute_body_edge_feats(self, body_edge_idx, node_pos, batch_size) -> BodyEdgeFeats:
+        """Compute features for rigid body edges.
+
+        Args:
+            body_edge_idx: [2, num_edges] body edge connectivity
+            node_pos: [num_nodes, 3] node positions
+            batch_size: Batch size for retrieving cached rest distances
+
+        Returns:
+            BodyEdgeFeats with current and rest distances
+        """
         body_dists = node_pos[body_edge_idx[1]] - node_pos[body_edge_idx[0]]
         body_dists_norm = body_dists.norm(dim=1, keepdim=True)
 
@@ -817,6 +1018,19 @@ class GraphDataProcessor(BaseStateObject):
         return body_edge_feats
 
     def _compute_contact_edge_feats(self, contact_edge_idx, node_pos, node_vels, batch_size) -> ContactEdgeFeats:
+        """Compute features for ground contact edges.
+
+        Calculates contact distances, normals, tangents, and relative velocities.
+
+        Args:
+            contact_edge_idx: [2, num_edges] contact edge connectivity
+            node_pos: [num_nodes, 3] node positions
+            node_vels: [num_nodes, 3] node velocities
+            batch_size: Batch size for retrieving cached normals
+
+        Returns:
+            ContactEdgeFeats with contact geometry and velocities
+        """
         n_rods = len(self.robot.rods) * 2
         body_rcvrs = torch.tensor(
             [[-1] * n_rods + [1] * n_rods], device=node_pos.device
@@ -851,6 +1065,21 @@ class GraphDataProcessor(BaseStateObject):
         return contact_edge_feats
 
     def _compute_cable_edge_feats(self, cable_edge_idx, node_pos, node_vels, batch_size, ctrls) -> CableEdgeFeats:
+        """Compute features for cable edges.
+
+        Calculates cable distances, directions, velocities, and material properties.
+        Handles both control-based and rest-length-based cable input representations.
+
+        Args:
+            cable_edge_idx: [2, num_edges] cable edge connectivity
+            node_pos: [num_nodes, 3] node positions
+            node_vels: [num_nodes, 3] node velocities
+            batch_size: Batch size for retrieving cached properties
+            ctrls: [batch_size, num_actuated_cables, num_ctrls] control signals
+
+        Returns:
+            CableEdgeFeats with cable geometry, dynamics, and control
+        """
         cable_dists = node_pos[cable_edge_idx[1]] - node_pos[cable_edge_idx[0]]
         cable_dists_norm = cable_dists.norm(dim=1, keepdim=True)
         cable_dir = cable_dists / cable_dists_norm
@@ -919,13 +1148,18 @@ class GraphDataProcessor(BaseStateObject):
                             contact_edge_idx,
                             batch_size,
                             **kwargs):
-        """
-        Method to compute all edge feats
+        """Compute all edge features for body, cable, and contact edges.
 
-        @param node_feats: dictionary of node feats
-        @param edge_indices: (2, num edges)
-        @param batch_size: size of batch
-        @return: Dictionary of feat tensors
+        Args:
+            node_feats: NodeFeats containing node positions and velocities
+            body_edge_idx: [2, num_body_edges] body edge connectivity
+            cable_edge_idx: [2, num_cable_edges] cable edge connectivity
+            contact_edge_idx: [2, num_contact_edges] contact edge connectivity
+            batch_size: Number of graphs in batch
+            **kwargs: Must contain 'ctrls' for cable control signals
+
+        Returns:
+            Tuple of (body_edge_feats, cable_edge_feats, contact_edge_feats)
         """
         # body edges
         body_edge_feats = self._compute_body_edge_feats(
@@ -954,6 +1188,15 @@ class GraphDataProcessor(BaseStateObject):
         return body_edge_feats, cable_edge_feats, contact_edge_feats
 
     def _get_body_mask(self, batch_size, device):
+        """Create boolean mask distinguishing body nodes from ground node.
+
+        Args:
+            batch_size: Number of graphs in batch
+            device: Target device for tensor
+
+        Returns:
+            [batch_size * (num_nodes + 1), 1] mask (True for body, False for ground)
+        """
         body_mask = torch.tensor(
             [True] * self.robot.num_nodes + [False],
             dtype=torch.bool,
@@ -964,6 +1207,23 @@ class GraphDataProcessor(BaseStateObject):
     def forward(self,
                 batch_state: torch.Tensor,
                 **kwargs: torch.Tensor):
+        """Convert batch of SE(3) robot states to graph-structured features.
+
+        Main processing pipeline that transforms rigid body states into complete
+        graph representations suitable for GNN physics prediction.
+
+        Args:
+            batch_state: [batch_size, 13 * num_rods] SE(3) states
+                Format per rod: [pos(3), quat(4), lin_vel(3), ang_vel(3)]
+            **kwargs: Must contain:
+                - 'ctrls': [batch_size, num_cables, num_ctrls] control signals
+                - 'dataset_idx': [batch_size, 1] dataset identifiers
+
+        Returns:
+            Tuple of (graph_feats, raw_feats):
+                - graph_feats: GraphFeats with normalized features ready for GNN
+                - raw_feats: Tuple of raw feature NamedTuples for auxiliary tasks
+        """
         batch_size = batch_state.shape[0]
 
         # Convert batch state to node_pos and prev_node_pos
@@ -1040,6 +1300,18 @@ class GraphDataProcessor(BaseStateObject):
 
     @staticmethod
     def feats2graph(graph_feats: GraphFeats, raw_feats: List):
+        """Convert feature NamedTuples to PyTorch Geometric Data object.
+
+        Combines normalized graph features and raw features into a single
+        graph data object compatible with PyTorch Geometric.
+
+        Args:
+            graph_feats: GraphFeats with normalized features
+            raw_feats: List of raw feature NamedTuples
+
+        Returns:
+            torch_geometric.data.Data object with all features as attributes
+        """
         combined_graph_feats = {
             **graph_feats._asdict(),
             **{k: v for raw_feat in raw_feats for k, v in raw_feat._asdict().items()},
