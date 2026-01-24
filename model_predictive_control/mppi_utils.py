@@ -400,8 +400,6 @@ def plot(h_val_arr, obs_val_arr, boundary, grid_step):
     plt.show()
 
     obs_val_arr_cpy = obs_val_arr.copy()
-    # obs_val_arr_cpy[obs_val_arr_cpy == np.inf] = -1.
-    # obs_val_arr_cpy[obs_val_arr_cpy == -1] = obs_val_arr_cpy.max() + 10
     obs_val_arr_cpy2 = np.clip(obs_val_arr_cpy, 0., 500)
 
     x = np.linspace(boundary[1], boundary[0], h_val_arr.shape[1])
@@ -414,9 +412,6 @@ def plot(h_val_arr, obs_val_arr, boundary, grid_step):
     plt.show()
     plt.imshow((obs_val_arr_cpy2 + h_val_arr).T)
     plt.colorbar()
-    # fig = plt.figure()
-    # ax = fig.add_subplot(111, projection='3d')
-    # surf = ax.plot_surface(X, Y, (obs_val_arr_cpy + h_val_arr).T)
     plt.title("combined")
     plt.show()
 
@@ -450,5 +445,4 @@ def plot(h_val_arr, obs_val_arr, boundary, grid_step):
     plt.xlabel("x")
     plt.ylabel("y")
     plt.title("Vector Field")
-    # plt.axis('equal')
     plt.show()

@@ -20,8 +20,50 @@ from mujoco_visualizer_utils.mujoco_visualizer import MuJoCoVisualizer
 from utilities import torch_quaternion
 
 
-class TensegrityMJCEnvRunner:
+class TensegrityMPPIRunner:
+    """
+    Stand-alone runner for tensegrity robot using Model Predictive Path Integral (MPPI) control.
+
+    This class manages the full simulation and control loop for a tensegrity robot navigating
+    to a goal position using MPPI planning. It handles environment setup, visualization,
+    data logging, and trajectory reproduction.
+    """
+
     def __init__(self, cfg):
+        """
+        Initialize the MPPI runner with environment, planner, and visualization.
+
+        Args:
+            cfg (dict): Configuration dictionary containing:
+                - sensor_interval (float): Time interval between sensor readings
+                - mppi_params (dict): MPPI planner parameters including 'act_interval'
+                - max_time (float): Maximum simulation time
+                - tol (float): Distance tolerance to goal
+                - output (str): Output directory path
+                - visualize (bool): Whether to enable visualization
+                - save_data (bool): Whether to save trajectory data
+                - xml_path (str): Path to MuJoCo XML model file
+                - env_type (str): Type of environment
+                - env_kwargs (dict): Additional environment kwargs
+                - start (list): Starting position and orientation [x, y, angle]
+                - obstacles (list): List of obstacle configurations
+                - boundary (list): Boundary constraints
+                - goal (list): Goal position [x, y, z]
+                - wave_grid_step (float): Grid step for wave propagation
+                - vis_xml_path (str): Path to visualization XML (if visualize=True)
+        """
+        self.env_dt = 0.01
+        self.sim_dt = 0.01
+
+        self.sensor_interval = cfg['sensor_interval']
+        self.env_act_interval = int(cfg['mppi_params']['act_interval'] / self.env_dt)
+        self.sim_act_interval = int(cfg['mppi_params']['act_interval'] / self.sim_dt)
+        self.max_steps = cfg['max_time'] / self.env_dt
+        self.tol = cfg['tol']
+
+        self.prev_pose_and_t = deque([], maxlen=20)
+
+        # Initialize from parent class
         self.logger = self._get_logger(cfg)
 
         self.cfg = cfg
@@ -41,12 +83,43 @@ class TensegrityMJCEnvRunner:
 
         self.shift_env_robot_to_start(cfg)
 
-        # Initial env robot stabilization for 5s
+        # Initial env robot stabilization for 10s
         self.env.env.run_w_target_gaits([[1, 1, 1, 1, 1, 1]])
         for _ in range(1000):
             self.env.step(np.zeros((1, self.env.env.n_actuators)))
 
+    def _get_logger(self, cfg):
+        """
+        Create and configure a logger that outputs to both console and file.
+
+        Args:
+            cfg (dict): Configuration dictionary with 'output' key for log file location
+
+        Returns:
+            logging.Logger: Configured logger instance
+        """
+        logger = logging.Logger("logger")
+        logger.setLevel(logging.DEBUG)  # Set the minimum logging level
+
+        # Create handlers
+        console_handler = logging.StreamHandler()  # Log to stdout
+        console_handler.setLevel(logging.DEBUG)
+        file_handler = logging.FileHandler(Path(cfg['output'], "log.txt"))
+        file_handler.setLevel(logging.DEBUG)
+        logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
+
+        return logger
+
     def _init_visualizer(self, cfg):
+        """
+        Initialize MuJoCo visualizer and setup output directories for frames and videos.
+
+        Clears existing frame and video directories if they exist and creates fresh ones.
+
+        Args:
+            cfg (dict): Configuration with 'vis_xml_path' and 'goal' keys
+        """
         self.vis = MuJoCoVisualizer()
         self.vis.set_xml_path(Path(cfg['vis_xml_path']))
         self.vis.mjc_model.site_pos[0] = cfg['goal']
@@ -63,43 +136,35 @@ class TensegrityMJCEnvRunner:
         self.frames_path.mkdir(exist_ok=True)
 
     def _init_planner(self, cfg):
-        pass
+        """
+        Initialize the MPPI planner with obstacle avoidance and goal tracking.
 
-    def _get_logger(self, cfg):
-        logger = logging.Logger("logger")
-        logger.setLevel(logging.DEBUG)  # Set the minimum logging level
+        Args:
+            cfg (dict): Configuration containing obstacles, boundary, goal, and MPPI parameters
 
-        # Create handlers
-        console_handler = logging.StreamHandler()  # Log to stdout
-        console_handler.setLevel(logging.DEBUG)
-        file_handler = logging.FileHandler(Path(cfg['output'], "log.txt"))
-        file_handler.setLevel(logging.DEBUG)
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-
-        return logger
-
-    def rererun(self):
-        all_processed_data = json.load(Path(self.output, 'processed_data.json').open('r'))
-        all_extra_data = json.load(Path(self.output, 'extra_state_data.json').open('r'))
-
-        processed_data1, extra_data1 = self.rerun(all_processed_data[0]['pos'],
-                                                  all_processed_data[0]['quat'],
-                                                  all_processed_data[0]['linvel'],
-                                                  all_processed_data[0]['angvel'],
-                                                  all_extra_data[0]['rest_lengths'],
-                                                  all_extra_data[0]['motor_speeds'],
-                                                  [[dd for dd in d['controls']] for d in all_extra_data])
-
-        print(max([max([abs(a - b) for a, b in zip(p0['pos'], p1['pos'])]) for p0, p1 in
-                   zip(all_processed_data, processed_data1)]))
-        print(max([max([abs(a - b) for a, b in zip(p0['quat'], p1['quat'])]) for p0, p1 in
-                   zip(all_processed_data, processed_data1)]))
-        print(max([max([max([abs(a - b) for a, b in zip(p0['end_pts'][k], p1['end_pts'][k])])
-                        for k in range(12)])
-                   for p0, p1 in zip(all_processed_data, processed_data1)]))
+        Returns:
+            TensegrityMPPIPlanner: Initialized MPPI planner instance
+        """
+        return TensegrityMPPIPlanner(
+            obstacles=cfg['obstacles'],
+            boundary=cfg['boundary'],
+            goal=cfg['goal'],
+            grid_step=cfg['wave_grid_step'],
+            tol=cfg['tol'],
+            logger=self.logger,
+            **cfg['mppi_params']
+        )
 
     def shift_env_robot_to_start(self, cfg):
+        """
+        Move and rotate the robot to the specified starting position and orientation.
+
+        This method computes the rotation needed to align the robot to the desired
+        starting angle, then translates it to the starting position.
+
+        Args:
+            cfg (dict): Configuration with 'start' key as [x, y, angle]
+        """
         start, final_angle = cfg['start'][:2], cfg['start'][2]
 
         pos = self.env.env.mjc_data.qpos.reshape(-1, 7).copy()
@@ -124,49 +189,12 @@ class TensegrityMJCEnvRunner:
 
         self.env.env.mjc_data.qpos = pos.flatten()
 
-    def step_env(self, num_step, action_args, **kwargs):
-        pass
-
-    def plan(self, step):
-        pass
-
-    def run_goal(self):
-        pass
-
-    def _reproduce_traj_data(self, all_extra_data, all_processed_data):
-        processed_data1, extra_data1 = self.rerun(all_processed_data[0]['pos'],
-                                                  all_processed_data[0]['quat'],
-                                                  all_processed_data[0]['linvel'],
-                                                  all_processed_data[0]['angvel'],
-                                                  all_extra_data[0]['rest_lengths'],
-                                                  all_extra_data[0]['motor_speeds'],
-                                                  [[dd for dd in d['controls']] for d in all_extra_data])
-        processed_data2, extra_data2 = self.rerun(processed_data1[0]['pos'],
-                                                  processed_data1[0]['quat'],
-                                                  processed_data1[0]['linvel'],
-                                                  processed_data1[0]['angvel'],
-                                                  extra_data1[0]['rest_lengths'],
-                                                  extra_data1[0]['motor_speeds'],
-                                                  [[dd for dd in d['controls']] for d in extra_data1])
-        print(max([max([abs(a - b) for a, b in zip(p0['pos'], p1['pos'])]) for p0, p1 in
-                   zip(all_processed_data, processed_data1)]))
-        print(max([max([abs(a - b) for a, b in zip(p0['quat'], p1['quat'])]) for p0, p1 in
-                   zip(all_processed_data, processed_data1)]))
-        e1 = max([max([abs(a - b) for a, b in zip(p0['pos'], p1['pos'])]) for p0, p1 in
-                  zip(processed_data2, processed_data1)])
-        e2 = max([max([abs(a - b) for a, b in zip(p0['quat'], p1['quat'])]) for p0, p1 in
-                  zip(processed_data2, processed_data1)])
-        error = max(e1, e2)
-        print(f'Reproducible error: {error}')
-        if error < 1e-10:
-            self._save_train_data(extra_data2, processed_data2)
-        else:
-            raise ValueError('error too high')
-
-    def _vis_env_data(self, poses, step_num, **vis_kwargs):
-        pass
-
     def add_goal(self):
+        """
+        Add goal visualization marker to the scene.
+
+        Creates a blue sphere at the goal position for visualization.
+        """
         goal_arr = np.array([self.cfg['goal'], self.cfg['goal']])
         goal_arr[1] += 0.001
         self.vis.add_path_to_scene(
@@ -176,6 +204,16 @@ class TensegrityMJCEnvRunner:
         )
 
     def _init_data(self):
+        """
+        Initialize or restore simulation data.
+
+        If 'restart' is True in config, loads previous state from saved JSON files.
+        Otherwise, initializes fresh data structures and resets the planner.
+
+        Returns:
+            tuple: (all_extra_data, all_processed_data, poses) - Lists containing
+                   trajectory data, processed state data, and pose history
+        """
         if 'restart' in self.cfg and self.cfg['restart']:
             poses = json.load(Path(self.cfg['output'], 'poses.json').open('r'))
             all_processed_data = json.load(Path(self.cfg['output'], 'processed_data.json').open('r'))
@@ -215,16 +253,81 @@ class TensegrityMJCEnvRunner:
         return all_extra_data, all_processed_data, poses
 
     def _save_pose_data(self, poses):
+        """
+        Save pose data to JSON file.
+
+        Args:
+            poses (list): List of pose dictionaries to save
+        """
         with Path(self.output, "poses.json").open('w') as fp:
             json.dump(poses, fp)
 
     def _save_train_data(self, all_extra_data, all_processed_data):
+        """
+        Save training data to JSON files.
+
+        Args:
+            all_extra_data (list): List of extra state data dictionaries
+            all_processed_data (list): List of processed state data dictionaries
+        """
         with Path(self.output, "processed_data.json").open('w') as fp:
             json.dump(all_processed_data[:-1], fp)
         with Path(self.output, "extra_state_data.json").open('w') as fp:
             json.dump(all_extra_data, fp)
 
+    def _reproduce_traj_data(self, all_extra_data, all_processed_data):
+        """
+        Reproduce trajectory data from saved JSON files.
+
+        Args:
+            all_extra_data (list): List of extra state data dictionaries
+            all_processed_data (list): List of processed state data dictionaries
+        """
+        processed_data1, extra_data1 = self.rerun(all_processed_data[0]['pos'],
+                                                  all_processed_data[0]['quat'],
+                                                  all_processed_data[0]['linvel'],
+                                                  all_processed_data[0]['angvel'],
+                                                  all_extra_data[0]['rest_lengths'],
+                                                  all_extra_data[0]['motor_speeds'],
+                                                  [[dd for dd in d['controls']] for d in all_extra_data])
+        processed_data2, extra_data2 = self.rerun(processed_data1[0]['pos'],
+                                                  processed_data1[0]['quat'],
+                                                  processed_data1[0]['linvel'],
+                                                  processed_data1[0]['angvel'],
+                                                  extra_data1[0]['rest_lengths'],
+                                                  extra_data1[0]['motor_speeds'],
+                                                  [[dd for dd in d['controls']] for d in extra_data1])
+        print(max([max([abs(a - b) for a, b in zip(p0['pos'], p1['pos'])]) for p0, p1 in
+                   zip(all_processed_data, processed_data1)]))
+        print(max([max([abs(a - b) for a, b in zip(p0['quat'], p1['quat'])]) for p0, p1 in
+                   zip(all_processed_data, processed_data1)]))
+        e1 = max([max([abs(a - b) for a, b in zip(p0['pos'], p1['pos'])]) for p0, p1 in
+                  zip(processed_data2, processed_data1)])
+        e2 = max([max([abs(a - b) for a, b in zip(p0['quat'], p1['quat'])]) for p0, p1 in
+                  zip(processed_data2, processed_data1)])
+        error = max(e1, e2)
+        print(f'Reproducible error: {error}')
+        if error < 1e-10:
+            self._save_train_data(extra_data2, processed_data2)
+        else:
+            raise ValueError('error too high')
+
     def rerun(self, init_pos, init_quat, init_linvel, init_angvel, init_rest, init_mspeeds, controls):
+        """
+        Re-run the simulation from an initial state with given controls.
+
+        Args:
+            init_pos (list): Initial position
+            init_quat (list): Initial quaternion
+            init_linvel (list): Initial linear velocity
+            init_angvel (list): Initial angular velocity
+            init_rest (list): Initial rest lengths
+            init_mspeeds (list): Initial motor speeds
+            controls (list): List of control sequences
+
+        Returns:
+            tuple: (processed_data, extra_data) - Lists containing processed and extra state data
+        """
         env_copy = MJCTensegrityEnv(self.xml, env_type=self.cfg['env_type'], **self.env_kwargs)
 
         init_pos_arr = np.array(init_pos, dtype=np.float64).reshape(-1, 3)
@@ -281,35 +384,50 @@ class TensegrityMJCEnvRunner:
 
         return processed_data, extra_data
 
+    def rererun(self):
+        """
+        Re-run the simulation from saved JSON files.
 
-class TensegrityMPPIRunner(TensegrityMJCEnvRunner):
+        Args:
+            all_processed_data (list): List of processed state data dictionaries
+            all_extra_data (list): List of extra state data dictionaries
 
-    def __init__(self, cfg):
-        self.env_dt = 0.01
-        self.sim_dt = 0.01
+        Returns:
+            tuple: (processed_data1, extra_data1) - Lists containing processed and extra state data
+        """
+        all_processed_data = json.load(Path(self.output, 'processed_data.json').open('r'))
+        all_extra_data = json.load(Path(self.output, 'extra_state_data.json').open('r'))
 
-        self.sensor_interval = cfg['sensor_interval']
-        self.env_act_interval = int(cfg['mppi_params']['act_interval'] / self.env_dt)
-        self.sim_act_interval = int(cfg['mppi_params']['act_interval'] / self.sim_dt)
-        self.max_steps = cfg['max_time'] / self.env_dt
-        self.tol = cfg['tol']
+        processed_data1, extra_data1 = self.rerun(all_processed_data[0]['pos'],
+                                                  all_processed_data[0]['quat'],
+                                                  all_processed_data[0]['linvel'],
+                                                  all_processed_data[0]['angvel'],
+                                                  all_extra_data[0]['rest_lengths'],
+                                                  all_extra_data[0]['motor_speeds'],
+                                                  [[dd for dd in d['controls']] for d in all_extra_data])
 
-        self.prev_pose_and_t = deque([], maxlen=20)
-
-        super().__init__(cfg)
-
-    def _init_planner(self, cfg):
-        return TensegrityMPPIPlanner(
-            obstacles=cfg['obstacles'],
-            boundary=cfg['boundary'],
-            goal=cfg['goal'],
-            grid_step=cfg['wave_grid_step'],
-            tol=cfg['tol'],
-            logger=self.logger,
-            **cfg['mppi_params']
-        )
+        print(max([max([abs(a - b) for a, b in zip(p0['pos'], p1['pos'])]) for p0, p1 in
+                   zip(all_processed_data, processed_data1)]))
+        print(max([max([abs(a - b) for a, b in zip(p0['quat'], p1['quat'])]) for p0, p1 in
+                   zip(all_processed_data, processed_data1)]))
+        print(max([max([max([abs(a - b) for a, b in zip(p0['end_pts'][k], p1['end_pts'][k])])
+                        for k in range(12)])
+                   for p0, p1 in zip(all_processed_data, processed_data1)]))
 
     def plan(self, step):
+        """
+        Compute MPPI control plan for the current step.
+
+        Senses the current robot state, converts to pose representation, and
+        uses the MPPI planner to generate optimal control actions.
+
+        Args:
+            step (int): Current simulation step number
+
+        Returns:
+            tuple: (step_type, actions, vis_data) - Planning step type, control actions,
+                   and visualization data for rendering trajectories
+        """
         end_pts, rest_lens, motor_speeds = self.env.sense()
         pose = self.planner.end_pts_to_pose(end_pts)
         self.prev_pose_and_t.append((pose, step * self.env_dt))
@@ -320,6 +438,25 @@ class TensegrityMPPIRunner(TensegrityMJCEnvRunner):
         return step_type, actions, vis_data
 
     def step_env(self, step, action_args: Tuple, **kwargs):
+        """
+        Execute environment steps with planned actions.
+
+        Runs the environment for env_act_interval steps using the provided control actions.
+        Collects pose data, checks for goal completion, and logs progress metrics.
+
+        Args:
+            step (int): Current step number
+            action_args (Tuple): Tuple containing action array
+            **kwargs: Additional keyword arguments (unused)
+
+        Returns:
+            tuple: (poses, step, reached_goal, processed_data, extra_data) containing:
+                - poses (list): List of pose dictionaries
+                - step (int): Updated step counter
+                - reached_goal (bool): Whether the goal was reached
+                - processed_data (list): Processed state data if save_data is enabled
+                - extra_data (list): Extra state data if save_data is enabled
+        """
         reached_goal = False
         poses = []
         processed_data, extra_data = [], []
@@ -379,6 +516,24 @@ class TensegrityMPPIRunner(TensegrityMJCEnvRunner):
         return poses, step, reached_goal, processed_data, extra_data
 
     def _vis_env_data(self, poses, step_num, **vis_kwargs):
+        """
+        Visualize environment data and generate video frames.
+
+        Creates visualization frames showing the robot trajectory and planned paths.
+        Renders frames every 4 steps and saves them as images.
+
+        Args:
+            poses (list): List of pose dictionaries to visualize
+            step_num (int): Starting step number for frame naming
+            **vis_kwargs: Visualization parameters including:
+                - ctrl_type (str): Control type ('astar' or 'mppi')
+                - path (ndarray): Planned path for astar
+                - batch_pos (ndarray): Batch of sampled trajectories for MPPI
+                - chosen_path (ndarray): Selected optimal trajectory for MPPI
+
+        Returns:
+            list: List of rendered frames (numpy arrays)
+        """
         frames = []
         for i, pose in enumerate(poses[1:]):
             if i % 4 != 0:
@@ -405,6 +560,16 @@ class TensegrityMPPIRunner(TensegrityMJCEnvRunner):
         return frames
 
     def run_goal(self):
+        """
+        Run the main control loop to navigate the robot to the goal.
+
+        Executes MPPI planning and environment stepping in a loop until the goal is
+        reached or max_steps is exceeded. Handles data saving, visualization, and
+        trajectory reproduction.
+
+        Returns:
+            tuple: (poses, step) - Final pose history and step count
+        """
         all_extra_data, all_processed_data, poses = self._init_data()
         step = len(poses)
         reached_goal = False
@@ -455,10 +620,17 @@ class TensegrityMPPIRunner(TensegrityMJCEnvRunner):
 
 def combine_videos(video_dir, output_path):
     """
-    Combines multiple MP4 videos into a single MP4 video using OpenCV.
+    Combine multiple MP4 videos from a directory into a single MP4 video.
 
-    :param video_paths: List of paths to the input MP4 videos.
-    :param output_path: Path to save the combined MP4 video.
+    Finds all *vid.mp4 files in the directory, sorts them numerically by filename,
+    and concatenates them into a single output video using OpenCV.
+
+    Args:
+        video_dir (Path): Directory containing the input MP4 videos
+        output_path (Path): Path to save the combined MP4 video
+
+    Raises:
+        Exception: If an error occurs during video processing
     """
     try:
         video_paths = [p.as_posix() for p in Path(video_dir).glob("*vid.mp4")]

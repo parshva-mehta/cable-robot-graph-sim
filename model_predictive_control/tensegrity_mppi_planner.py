@@ -1,3 +1,11 @@
+"""
+Tensegrity robot motion planning using Model Predictive Path Integral (MPPI) control.
+
+This module implements an MPPI-based planner for tensegrity cable-driven robots,
+combining sampling-based trajectory optimization with grid-based heuristics for
+obstacle avoidance and goal-directed navigation.
+"""
+
 from logging import Logger
 from pathlib import Path
 
@@ -12,6 +20,18 @@ from utilities import torch_quaternion
 
 
 class TensegrityMPPIPlanner(torch.nn.Module):
+    """
+    Model Predictive Path Integral (MPPI) planner for tensegrity cable robots.
+
+    This planner uses sampling-based trajectory optimization to generate control
+    sequences for cable-driven tensegrity robots. It combines:
+    - Grid-based heuristic costs for distance-to-goal and obstacle avoidance
+    - Directional alignment costs for orientation control
+    - Terminal rewards for goal achievement
+
+    The planner samples multiple control trajectories, evaluates their costs through
+    forward simulation, and selects or weights them to produce an optimal control action.
+    """
 
     def __init__(self,
                  sim: AbstractSimulator | str | Path,
@@ -32,15 +52,40 @@ class TensegrityMPPIPlanner(torch.nn.Module):
                  grid_step=0.1,
                  tol: float = 0.5,
                  min_vel_dt=0.04):
+        """
+        Initialize the MPPI planner.
+
+        Args:
+            sim: Simulator instance or path to saved simulator model
+            n_samples: Number of trajectory samples to generate per planning iteration
+            horizon: Planning horizon in seconds
+            act_interval: Action interval in seconds (interval at which actions are applied)
+            ctrl_interval: Control interval in seconds (interval at which controls are sampled)
+            device: Torch device ('cpu' or 'cuda')
+            u_bounds: Control input bounds as (min, max) tuple
+            gamma: Discount factor for future costs (1.0 = no discounting)
+            rest_len_bounds: Cable rest length bounds as (min, max) tuple in meters
+            goal: Goal position as (x, y, z) tuple
+            obstacles: Tuple of box obstacles, each as (xmin, xmax, ymin, ymax)
+            boundary: Planning boundary as (xmin, xmax, ymin, ymax)
+            logger: Logger instance for output
+            strategy: Trajectory selection strategy ('min' or 'weighted')
+                - 'min': Select trajectory with minimum cost
+                - 'weighted': Weight trajectories by exponential of negative cost
+            cost_weights: Weights for (distance, direction, obstacle) costs
+            grid_step: Grid resolution for heuristic cost computation in meters
+            tol: Goal tolerance threshold in meters
+            min_vel_dt: Minimum time difference for velocity estimation in seconds
+        """
         super().__init__()
         self.logger = logger
 
         if isinstance(sim, str) or isinstance(sim, Path):
             self.sim = torch.load(sim, map_location='cpu', weights_only=False)
-            self.sim.to(device)
         else:
             self.sim = sim
 
+        self.sim.to(device)
         self.dt = self.sim.data_processor.dt.item()
 
         self.min_vel_dt = min_vel_dt
@@ -102,6 +147,15 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         )
 
     def to(self, device):
+        """
+        Move planner and all associated tensors to specified device.
+
+        Args:
+            device: Target device ('cpu' or 'cuda')
+
+        Returns:
+            Self for method chaining
+        """
         self.device = device
         self.dist_cost_grid = self.dist_cost_grid.to(device)
         self.obs_cost_grid = self.obs_cost_grid.to(device)
@@ -114,9 +168,29 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
     @staticmethod
     def _compute_weight(cost, beta, factor):
+        """
+        Compute trajectory weights for MPPI weighted strategy.
+
+        Args:
+            cost: Cost values, shape (nsamples,)
+            beta: Minimum cost value for normalization
+            factor: Temperature factor for exponential weighting
+
+        Returns:
+            Weight values, shape (nsamples,)
+        """
         return torch.exp(-factor * (cost - beta))
 
     def map(self, data):
+        """
+        Convert input data to torch tensor with planner's device and dtype.
+
+        Args:
+            data: Input data (numpy array, list, or torch tensor)
+
+        Returns:
+            Torch tensor on planner's device and dtype
+        """
         if isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, list):
@@ -131,6 +205,15 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
     @staticmethod
     def endpts_to_5d_pose(end_pts):
+        """
+        Convert robot endpoints to 5D pose representation (position + quaternion).
+
+        Args:
+            end_pts: Endpoint positions, shape (batch, 6)
+
+        Returns:
+            Pose tensor with position and quaternion, shape (batch, 7, 1)
+        """
         end_pts_ = end_pts.reshape(-1, 6, 1)
         curr_pos = (end_pts_[:, :3] + end_pts_[:, 3:]) / 2.
         prin = (end_pts_[:, 3:] - end_pts_[:, :3])
@@ -139,6 +222,18 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return torch.hstack([curr_pos, curr_quat])
 
     def rollout(self, curr_state_, batch_actions):
+        """
+        Simulate forward dynamics for a batch of action sequences.
+
+        Args:
+            curr_state_: Current state tensor, shape (batch, state_dim, 1)
+            batch_actions: Batch of action sequences, shape (batch, n_ctrls, horizon)
+
+        Returns:
+            Tuple of (states, costs) where:
+                - states: Concatenated state trajectory, shape (batch, state_dim, horizon+1)
+                - costs: Tuple of (total_costs, dist_costs, dir_costs, obs_costs) as lists
+        """
         states = [curr_state_.clone()]
         state_to_graph_kwargs = {'dataset_idx': torch.tensor([8]).repeat(curr_state_.shape[0]).reshape(-1, 1)}
         sim_states, _, _ = self.sim.run(
@@ -167,10 +262,29 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return states, (costs, dist_costs, dir_costs, obs_costs)
 
     def set_goals(self, com_goal):
+        """
+        Set goal position for planning.
+
+        Args:
+            com_goal: Goal center-of-mass position as numpy array or list
+        """
         self.goal = self.map(com_goal)
         self.goal[:, 2] = 0.
 
     def heuristic_grid_cost(self, curr_state):
+        """
+        Compute grid-based heuristic costs for distance-to-goal and obstacles.
+
+        Uses precomputed wavefront propagation grids to efficiently evaluate
+        distance costs and obstacle costs based on robot center-of-mass and
+        endpoint positions.
+
+        Args:
+            curr_state: Current state tensor
+
+        Returns:
+            Tuple of (dist_cost, obs_cost) tensors, shape (batch,)
+        """
         curr_state = self.map(curr_state)
         com = (curr_state.reshape(curr_state.shape[0], -1, 13)[..., :3]
                .mean(dim=1).unsqueeze(-1))
@@ -184,6 +298,18 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return dist_cost, obs_cost
 
     def multi_goal_costs(self, curr_state):
+        """
+        Compute costs for multi-waypoint trajectory following.
+
+        Evaluates costs for following a path through multiple goal waypoints,
+        penalizing deviation from the path and distance to final goal.
+
+        Args:
+            curr_state: Current state tensor
+
+        Returns:
+            Tuple of (total_costs, zero_costs), each shape (batch, 1)
+        """
         curr_state = self.map(curr_state)
         com = (curr_state.reshape(curr_state.shape[0], -1, 13)[..., :3]
                .mean(dim=1).unsqueeze(-1))
@@ -218,10 +344,29 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return costs, torch.zeros_like(costs)[:, :1]
 
     def compute_end_pts(self, curr_state):
+        """
+        Compute robot endpoint positions from state.
+
+        Args:
+            curr_state: Current state tensor
+
+        Returns:
+            Endpoint positions tensor, shape (batch, 3, n_endpoints)
+        """
         return self.sim.robot.compute_end_pts(curr_state)
 
     @staticmethod
     def _dist2d_pt_to_line_seg(pt, line_seg):
+        """
+        Compute 2D distance from points to line segments.
+
+        Args:
+            pt: Point positions, shape (batch, 2, ...)
+            line_seg: Tuple of (start, end) line segment tensors
+
+        Returns:
+            Distance tensor, shape (batch, 1, n_segments)
+        """
         pt = pt.reshape(pt.shape[0], pt.shape[1], 1)
         v = line_seg[1] - line_seg[0]
         length = v.norm(dim=1, keepdim=True)
@@ -237,7 +382,17 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
     def box_obstacle_costs(self, curr_state):
         """
-        end_pts: (batch_size, 3, num_end_pts)
+        Compute obstacle avoidance costs based on distances to box obstacles.
+
+        Evaluates the minimum distance from robot endpoints to obstacle boundaries,
+        accounting for robot sphere radius. Cost increases as inverse square root
+        of distance to encourage obstacle avoidance.
+
+        Args:
+            curr_state: Current state tensor, shape (batch, state_dim)
+
+        Returns:
+            Obstacle costs, shape (batch,)
         """
         curr_state = self.map(curr_state)
 
@@ -278,6 +433,15 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return costs.flatten()
 
     def _dist_costs(self, curr_state):
+        """
+        Compute distance and directional costs (alternative formulation).
+
+        Args:
+            curr_state: Current state tensor
+
+        Returns:
+            Tuple of (dist_costs, dir_costs), each shape (batch,)
+        """
         curr_state = self.map(curr_state)
         com = (curr_state.reshape(curr_state.shape[0], -1, 13)[..., :3]
                .mean(dim=1).unsqueeze(-1))
@@ -287,13 +451,6 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         goal_dir = goal_dir / dist_costs
 
         dist_costs = dist_costs ** 2
-
-        # prin = torch_quaternion.quat_as_rot_mat(
-        #     curr_state.reshape(-1, 13, 1)[:, 3:7]
-        # )[..., -1:].reshape(curr_state.shape[0], -1, 3)
-        # prin = prin.mean(dim=1).unsqueeze(-1)
-        # prin[:, 2] = 0.0
-        # prin /= prin.norm(dim=1, keepdim=True)
 
         end_pts = self.compute_end_pts(curr_state)
         mid_left = end_pts[..., ::2].mean(dim=-1, keepdim=True)
@@ -309,6 +466,15 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return dist_costs.flatten(), dir_costs.flatten()
 
     def multi_goal_dists_cost(self, curr_state):
+        """
+        Compute distance costs for multiple goals (alternative formulation).
+
+        Args:
+            curr_state: Current state tensor
+
+        Returns:
+            Tuple of (total_dist, dir_costs), each shape (batch,)
+        """
         curr_state = self.map(curr_state)
         com = (curr_state.reshape(curr_state.shape[0], -1, 13)[..., :3]
                .mean(dim=1).unsqueeze(-1))
@@ -339,6 +505,18 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return total_dist.squeeze(-1), dir_costs
 
     def dir_cost(self, curr_state, curr_dir):
+        """
+        Compute directional alignment cost.
+
+        Penalizes misalignment between robot's principal axis and desired direction.
+
+        Args:
+            curr_state: Current state tensor
+            curr_dir: Desired direction vector, shape (batch, 2, 1), or None
+
+        Returns:
+            Directional cost tensor, shape (batch,)
+        """
         if curr_dir is None:
             return torch.zeros_like(curr_state[:, :1]).flatten()
 
@@ -355,6 +533,18 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return dir_cost.flatten()
 
     def terminal_cost(self, curr_state):
+        """
+        Compute terminal reward for reaching the goal.
+
+        Provides negative cost (reward) when robot center-of-mass is within
+        goal tolerance threshold.
+
+        Args:
+            curr_state: Current state tensor
+
+        Returns:
+            Terminal cost tensor, shape (batch,)
+        """
         xy_com = curr_state.reshape(curr_state.shape[0], -1, 13)[..., :2].mean(dim=1)
         goal = self.goal[:, :2]
         dist = (goal - xy_com).norm(dim=1)
@@ -364,6 +554,16 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return terminal.flatten()
 
     def all_costs(self, curr_state, curr_dir=None):
+        """
+        Compute all cost components for a given state.
+
+        Args:
+            curr_state: Current state tensor
+            curr_dir: Desired direction vector, or None
+
+        Returns:
+            Tuple of (dist_cost, dir_cost, obs_cost) tensors, each shape (batch,)
+        """
         dist_cost, obs_cost = self.heuristic_grid_cost(curr_state)
         # _dist_cost, dir_cost = self._dist_costs(curr_state)
         # _obs_cost = self.box_obstacle_costs(curr_state)
@@ -374,6 +574,16 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return dist_cost, dir_cost, obs_cost
 
     def reset_sim_pose(self, curr_pose_time, prev_pose_time, rest_lengths=None, motor_speeds=None, batch_size=1):
+        """
+        Reset simulator with pose observations and estimated velocities.
+
+        Args:
+            curr_pose_time: Tuple of (current_pose, timestamp)
+            prev_pose_time: Tuple of (previous_pose, timestamp) for velocity estimation
+            rest_lengths: Cable rest lengths
+            motor_speeds: Motor angular velocities
+            batch_size: Batch size for parallel simulation
+        """
         rest_lengths = self.map(rest_lengths).unsqueeze(0)
         motor_speeds = self.map(motor_speeds).unsqueeze(0)
 
@@ -400,6 +610,15 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         self.reset_sim_state(curr_state, motor_speeds, rest_lengths, batch_size)
 
     def reset_sim_state(self, curr_state, motor_speeds, rest_lengths, batch_size=1):
+        """
+        Reset simulator with full state information.
+
+        Args:
+            curr_state: Current state tensor, shape (1, state_dim, 1)
+            motor_speeds: Motor angular velocities
+            rest_lengths: Cable rest lengths
+            batch_size: Batch size for parallel simulation
+        """
         self.sim.reset()
 
         curr_state = self.map(curr_state).reshape(1, -1, 1)
@@ -413,6 +632,14 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         self.reset_cables(rest_lengths, motor_speeds, batch_size)
 
     def reset_cables(self, rest_lengths, motor_speeds, batch_size):
+        """
+        Reset cable states for all actuated cables.
+
+        Args:
+            rest_lengths: Cable rest lengths, shape (1, n_cables, 1)
+            motor_speeds: Motor angular velocities, shape (1, n_cables, 1)
+            batch_size: Batch size for parallel simulation
+        """
         cables = self.sim.robot.actuated_cables.values()
         for i, c in enumerate(cables):
             if rest_lengths is not None:
@@ -421,6 +648,20 @@ class TensegrityMPPIPlanner(torch.nn.Module):
                 c.motor.motor_state.omega_t = motor_speeds[:, i: i + 1].repeat(batch_size, 1, 1)
 
     def plan(self, prev_n_pose_time_tups, rest_lens, motor_speeds):
+        """
+        Generate optimal control sequence using MPPI.
+
+        Args:
+            prev_n_pose_time_tups: List of (pose, timestamp) tuples for velocity estimation
+            rest_lens: Current cable rest lengths
+            motor_speeds: Current motor angular velocities
+
+        Returns:
+            Tuple of (min_actions, min_act_states, batch_states) where:
+                - min_actions: Optimal action sequence
+                - min_act_states: States resulting from optimal actions
+                - batch_states: All sampled trajectory states
+        """
         curr_pose, curr_timestamp = prev_n_pose_time_tups[-1]
         prev_pose_timestep = None
         for prev_pose_timestep in prev_n_pose_time_tups[:-1][::-1]:
@@ -449,6 +690,16 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return min_actions, min_act_states, batch_states
 
     def compute_ctrl_lims(self, rest_lens, motor_speeds):
+        """
+        Compute simple control limits based on rest length bounds.
+
+        Args:
+            rest_lens: Current cable rest lengths
+            motor_speeds: Current motor angular velocities
+
+        Returns:
+            Tuple of (lower, upper) control limits, each shape (n_cables,)
+        """
         rest_lens = self.map(rest_lens)
         upper = (rest_lens >= self.rest_min).to(self.dtype).flatten()
         lower = -(rest_lens <= self.rest_max).to(self.dtype).flatten()
@@ -456,6 +707,19 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
 
     def compute_ctrl_lims2(self, rest_lens, motor_speeds):
+        """
+        Compute control limits considering motor dynamics and constraints.
+
+        Accounts for motor speed limits, winch radius, and current motor state
+        to compute feasible control bounds that respect physical constraints.
+
+        Args:
+            rest_lens: Current cable rest lengths
+            motor_speeds: Current motor angular velocities
+
+        Returns:
+            Tuple of (lower, upper) control limits, each shape (n_cables,)
+        """
         rest_lens = rest_lens.unsqueeze(-1)
         motor_speeds = motor_speeds.unsqueeze(-1)
 
@@ -484,6 +748,21 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return lower.flatten(), upper.flatten()
 
     def mppi_simple(self, curr_state, curr_rest_lens, curr_motor_speeds, nsamples):
+        """
+        MPPI with uniform random action sampling.
+
+        Samples action sequences uniformly from feasible control bounds without
+        using previous control sequence as a prior.
+
+        Args:
+            curr_state: Current state tensor
+            curr_rest_lens: Current cable rest lengths
+            curr_motor_speeds: Current motor angular velocities
+            nsamples: Number of trajectory samples
+
+        Returns:
+            Tuple of (min_actions, min_act_states, batch_states)
+        """
         lower, upper = self.compute_ctrl_lims(curr_rest_lens, curr_motor_speeds)
         # lower = -ones(6, ref_tensor=curr_state)
         # upper = ones(6, ref_tensor=curr_state)
@@ -499,6 +778,21 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return self.mppi(batch_actions, curr_motor_speeds, curr_rest_lens, curr_state, nsamples)
 
     def mppi_perturb(self, curr_state, curr_rest_lens, curr_motor_speeds, nsamples):
+        """
+        MPPI with perturbation-based action sampling.
+
+        Samples action sequences by perturbing the previous control sequence,
+        which provides temporal consistency and warm-starting for faster convergence.
+
+        Args:
+            curr_state: Current state tensor
+            curr_rest_lens: Current cable rest lengths
+            curr_motor_speeds: Current motor angular velocities
+            nsamples: Number of trajectory samples
+
+        Returns:
+            Tuple of (min_actions, min_act_states, batch_states)
+        """
         lower, upper = self.compute_ctrl_lims(curr_rest_lens, curr_motor_speeds)
         batch_act_perturb = 0.1 * torch.randn((nsamples, self.n_ctrls, self.horizon // self.ctrl_interval),
                                               dtype=self.dtype, device=self.device)
@@ -525,6 +819,17 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return min_actions, min_act_states, batch_states
 
     def get_curr_dir(self, curr_pose):
+        """
+        Get current direction vector from robot pose.
+
+        Computes the perpendicular direction to the robot's principal axis.
+
+        Args:
+            curr_pose: Current pose tensor, shape (batch, 7)
+
+        Returns:
+            Direction vector, shape (1, 2, 1)
+        """
         curr_pose = self.map(curr_pose).reshape(-1, 7, 1)
         prin = torch_quaternion.compute_prin_axis(curr_pose[:, 3:7]).mean(dim=0, keepdim=True)[:, :2]
         prin /= prin.norm(dim=1, keepdim=True)
@@ -532,6 +837,16 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return curr_dir
 
     def rel_2d_angle(self, curr_dir, goal_dir):
+        """
+        Compute relative 2D angle between current and goal directions.
+
+        Args:
+            curr_dir: Current direction vector
+            goal_dir: Goal direction vector
+
+        Returns:
+            Angle in radians, shape (1, 1)
+        """
         curr_dir = self.map(curr_dir).reshape(1, 2, 1)
         goal_dir = self.map(goal_dir).reshape(1, 2, 1)
 
@@ -542,6 +857,18 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return angle
 
     def get_goal_dir(self, curr_pose):
+        """
+        Compute goal direction from current position using gradient descent on cost grid.
+
+        Uses heuristic cost grid to determine the best local direction toward the goal
+        while avoiding obstacles.
+
+        Args:
+            curr_pose: Current pose tensor, shape (batch, 7, 1)
+
+        Returns:
+            Goal direction vector, shape (1, 2, 1)
+        """
         curr_pose = self.map(curr_pose)
         start_com = curr_pose.reshape(-1, 7, 1)[:, :2].mean(dim=0, keepdim=True)
         snapped_com = snap_to_grid_torch(start_com, self.grid_step, self.boundary)
@@ -556,6 +883,26 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         return curr_dir
 
     def mppi(self, batch_actions, curr_motor_speeds, curr_rest_lens, curr_state, nsamples):
+        """
+        Core MPPI algorithm for trajectory optimization.
+
+        Evaluates sampled action sequences through forward simulation, computes
+        their costs, and either selects the minimum cost trajectory or computes
+        a weighted combination based on the strategy.
+
+        Args:
+            batch_actions: Batch of action sequences, shape (nsamples, n_ctrls, horizon)
+            curr_motor_speeds: Current motor angular velocities
+            curr_rest_lens: Current cable rest lengths
+            curr_state: Current state tensor
+            nsamples: Number of trajectory samples
+
+        Returns:
+            Tuple of (min_actions, min_act_states, batch_states) where:
+                - min_actions: Selected or weighted optimal actions
+                - min_act_states: States from optimal trajectory
+                - batch_states: All sampled trajectory states
+        """
         curr_state_ = curr_state.clone().repeat(
             (nsamples if curr_state.shape[0] == 1 else 1), 1, 1)
 
