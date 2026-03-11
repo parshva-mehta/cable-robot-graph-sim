@@ -37,21 +37,21 @@ class TensegrityMPPIPlanner(torch.nn.Module):
                  sim: AbstractSimulator | str | Path,
                  n_samples: int,
                  horizon: float,
-                 act_interval: float,
                  ctrl_interval: float,
                  device: str = 'cpu',
                  u_bounds: tuple = (-1., 1.),
                  gamma: float = 1.0,
-                 rest_len_bounds: tuple = (0.8, 2.1),
+                 rest_len_bounds: tuple = (0.3, 2.0),
                  goal: tuple | None = None,
                  obstacles: tuple = (),
                  boundary: tuple = (),
                  logger: Logger | None = None,
                  strategy: 'str' = 'min',
                  cost_weights: tuple = (1.0, 0.0, 0.0),
-                 grid_step=0.1,
+                 grid_step: float=0.1,
                  tol: float = 0.5,
-                 min_vel_dt=0.04):
+                 min_vel_dt: float =0.04,
+                 torch_compile: bool=False):
         """
         Initialize the MPPI planner.
 
@@ -59,7 +59,6 @@ class TensegrityMPPIPlanner(torch.nn.Module):
             sim: Simulator instance or path to saved simulator model
             n_samples: Number of trajectory samples to generate per planning iteration
             horizon: Planning horizon in seconds
-            act_interval: Action interval in seconds (interval at which actions are applied)
             ctrl_interval: Control interval in seconds (interval at which controls are sampled)
             device: Torch device ('cpu' or 'cuda')
             u_bounds: Control input bounds as (min, max) tuple
@@ -82,8 +81,13 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         if isinstance(sim, str) or isinstance(sim, Path):
             self.sim = torch.load(sim, map_location='cpu', weights_only=False)
+            self.sim.to(device)
         else:
             self.sim = sim
+        self.sim.reset()
+
+        if torch_compile:
+            self.sim.run_compile()
 
         self.sim.to(device)
         self.dt = self.sim.data_processor.dt.item()
@@ -91,7 +95,6 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         self.min_vel_dt = min_vel_dt
         self.n_samples = n_samples
         self.horizon = round(horizon / self.dt)
-        self.act_interval = round(act_interval / self.dt)
         self.ctrl_interval = round(ctrl_interval / self.dt)
         self.dtype = self.sim.dtype
         self.device = device
@@ -101,7 +104,7 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         self.obs_cost_gain = 50.0
         self.obs_min_dist = 0.5
-        self.terminal_reward = -10.0
+        self.terminal_reward = -100.0
         self.goal_threshold = tol
 
         assert strategy in ['min', 'weighted']
@@ -111,8 +114,7 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         self.gamma_seq = torch.cumprod(
             torch.full((1, 1, self.horizon),
                        gamma,
-                       dtype=self.dtype,
-                       device=self.device),
+                       dtype=self.dtype),
             dim=-1
         )
 
@@ -288,8 +290,17 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         curr_state = self.map(curr_state)
         com = (curr_state.reshape(curr_state.shape[0], -1, 13)[..., :3]
                .mean(dim=1).unsqueeze(-1))
+
+        dist_cost = torch.zeros_like(com[:, 0, 0])
+
         idx = snap_to_grid_torch(com[:, :2], self.grid_step, self.boundary).squeeze(-1)
-        dist_cost = self.dist_cost_grid[idx[:, 0], idx[:, 1]]
+
+        in_grid = torch.logical_and(
+                torch.logical_and(0 <= idx[:, 0], idx[:, 0] < self.dist_cost_grid.shape[0]),
+                torch.logical_and(0 <= idx[:, 1], idx[:, 1] < self.dist_cost_grid.shape[1])
+            )
+        dist_cost[in_grid] = self.dist_cost_grid[idx[in_grid, 0], idx[in_grid, 1]]
+        dist_cost[~in_grid] = (com[~in_grid, :2, 0] - self.goal[:, :2]).norm(dim=1)
 
         end_pts = self.compute_end_pts(curr_state)
         idx = snap_to_grid_torch(end_pts[:, :2], self.grid_step, self.boundary).squeeze(-1)
@@ -432,7 +443,7 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         return costs.flatten()
 
-    def _dist_costs(self, curr_state):
+    def dist_costs(self, curr_state):
         """
         Compute distance and directional costs (alternative formulation).
 
@@ -448,22 +459,10 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         goal_dir = self.goals[:, :2] - com[:, :2]
         dist_costs = goal_dir.norm(dim=1, keepdim=True)
-        goal_dir = goal_dir / dist_costs
 
         dist_costs = dist_costs ** 2
 
-        end_pts = self.compute_end_pts(curr_state)
-        mid_left = end_pts[..., ::2].mean(dim=-1, keepdim=True)
-        mid_right = end_pts[..., 1::2].mean(dim=-1, keepdim=True)
-        prin = mid_right - mid_left
-        # prin = prin.mean(dim=1).unsqueeze(-1)
-        prin[:, 2] = 0.0
-        prin = prin / prin.norm(dim=1, keepdim=True)
-
-        # goal_dir = torch.tensor([-1., 0.], dtype=prin.dtype, device=prin.device).reshape(1, 2, 1)
-        dir_costs = torch.linalg.vecdot(goal_dir, prin[:, :2], dim=1).abs()
-
-        return dist_costs.flatten(), dir_costs.flatten()
+        return dist_costs.flatten()
 
     def multi_goal_dists_cost(self, curr_state):
         """
@@ -504,7 +503,7 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         return total_dist.squeeze(-1), dir_costs
 
-    def dir_cost(self, curr_state, curr_dir):
+    def dir_cost(self, curr_state, goal_dir):
         """
         Compute directional alignment cost.
 
@@ -512,23 +511,21 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         Args:
             curr_state: Current state tensor
-            curr_dir: Desired direction vector, shape (batch, 2, 1), or None
+            goal_dir: Desired direction vector, shape (batch, 2, 1), or None
 
         Returns:
             Directional cost tensor, shape (batch,)
         """
-        if curr_dir is None:
+        if goal_dir is None:
             return torch.zeros_like(curr_state[:, :1]).flatten()
 
-        prin = torch_quaternion.quat_as_rot_mat(
-            curr_state.reshape(-1, 13, 1)[:, 3:7]
-        )[..., -1:].reshape(curr_state.shape[0], -1, 3)
-        prin = prin.mean(dim=1).unsqueeze(-1)
-        prin[:, 2] = 0.0
+        q = curr_state.reshape(-1, 13, 1)[:, 3:7]
+        prin = torch_quaternion.compute_prin_axis(q).reshape(curr_state.shape[0], -1, 3).mean(dim=1)[:, :2]
         prin = prin / prin.norm(dim=1, keepdim=True)
+        heading = -torch.hstack([-prin[:, 1:], prin[:, :1]])
 
-        dir_cost = torch.linalg.vecdot(curr_dir, prin[:, :2], dim=1).abs()
-        dir_cost = (dir_cost + 1.) ** 2
+        angle = self.rel_2d_angle(heading, goal_dir)
+        dir_cost = torch.exp(8 * angle) - 1.
 
         return dir_cost.flatten()
 
@@ -549,7 +546,7 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         goal = self.goal[:, :2]
         dist = (goal - xy_com).norm(dim=1)
         close = dist < self.goal_threshold
-        terminal = torch.ones_like(dist) * self.terminal_reward * close
+        terminal = torch.full_like(dist, self.terminal_reward) * close
 
         return terminal.flatten()
 
@@ -689,63 +686,27 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
         return min_actions, min_act_states, batch_states
 
-    def compute_ctrl_lims(self, rest_lens, motor_speeds):
-        """
-        Compute simple control limits based on rest length bounds.
+    def compute_ctrl_lims(self, rest_lens, motor_speeds, curr_state):
+        end_pts = self.compute_end_pts(curr_state).transpose(0, 2)
+        cable_lens = []
+        for i, c in enumerate(self.sim.robot.actuated_cables.values()):
+            idx0, idx1 = c.end_pts[0][2], c.end_pts[1][2]
+            end_pt0, end_pt1 = end_pts[int(idx0)].unsqueeze(0), end_pts[int(idx1)].unsqueeze(0)
+            length = (end_pt1 - end_pt0).norm(dim=1, keepdim=True)
+            cable_lens.append(length)
 
-        Args:
-            rest_lens: Current cable rest lengths
-            motor_speeds: Current motor angular velocities
+        cable_lens = torch.vstack(cable_lens).flatten()
+        upper = (cable_lens >= self.cable_len_min).to(self.dtype).flatten()
+        lower = -(cable_lens <= self.cable_len_max).to(self.dtype).flatten()
 
-        Returns:
-            Tuple of (lower, upper) control limits, each shape (n_cables,)
-        """
-        rest_lens = self.map(rest_lens)
-        upper = (rest_lens >= self.rest_min).to(self.dtype).flatten()
-        lower = -(rest_lens <= self.rest_max).to(self.dtype).flatten()
+        # rest_lens = self.map(rest_lens)
+        # upper_rest = (rest_lens >= self.rest_min).to(self.dtype).flatten()
+        # lower_rest = -(rest_lens <= self.rest_max).to(self.dtype).flatten()
+
+        # upper = upper_cable * upper_rest
+        # lower = lower_cable * lower_rest
+
         return lower, upper
-
-
-    def compute_ctrl_lims2(self, rest_lens, motor_speeds):
-        """
-        Compute control limits considering motor dynamics and constraints.
-
-        Accounts for motor speed limits, winch radius, and current motor state
-        to compute feasible control bounds that respect physical constraints.
-
-        Args:
-            rest_lens: Current cable rest lengths
-            motor_speeds: Current motor angular velocities
-
-        Returns:
-            Tuple of (lower, upper) control limits, each shape (n_cables,)
-        """
-        rest_lens = rest_lens.unsqueeze(-1)
-        motor_speeds = motor_speeds.unsqueeze(-1)
-
-        cables = self.sim.robot.actuated_cables.values()
-        s = torch.vstack([c.motor.speed for c in cables])
-        m = torch.vstack([c.motor.max_omega for c in cables])
-        # s, m = 0.8, 220 * 2 * np.pi / 60
-        sm_inv = 1. / (s * m)
-        # r_w = 0.035
-        r_w = torch.vstack([c.winch_r for c in cables])
-
-        alpha = 2 * sm_inv / (self.dt * r_w)
-
-        lower = alpha * (rest_lens - self.rest_max) - motor_speeds * sm_inv
-        upper = alpha * (rest_lens - self.rest_min) - motor_speeds * sm_inv
-
-        lower = torch.clamp(lower, self.ctrl_min, self.ctrl_max - 1e-2)
-        upper = torch.clamp(upper, self.ctrl_min + 1e-2, self.ctrl_max)
-
-        # lower = torch.clamp(lower, self.u_min, 0.0).flatten()
-        # upper = torch.clamp(upper, 0.0, self.u_max).flatten()
-
-        # if (lower > -1).any() or (upper < 1.).any():
-        #     s=0
-
-        return lower.flatten(), upper.flatten()
 
     def mppi_simple(self, curr_state, curr_rest_lens, curr_motor_speeds, nsamples):
         """
@@ -847,8 +808,8 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         Returns:
             Angle in radians, shape (1, 1)
         """
-        curr_dir = self.map(curr_dir).reshape(1, 2, 1)
-        goal_dir = self.map(goal_dir).reshape(1, 2, 1)
+        curr_dir = self.map(curr_dir).reshape(-1, 2, 1)
+        goal_dir = self.map(goal_dir).reshape(-1, 2, 1)
 
         cross = goal_dir[:, 0] * curr_dir[:, 1] - goal_dir[:, 1] * curr_dir[:, 0]  # 2D cross product (scalar)
         dot = goal_dir[:, 0] * curr_dir[:, 0] + goal_dir[:, 1] * curr_dir[:, 1]
@@ -871,13 +832,18 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         """
         curr_pose = self.map(curr_pose)
         start_com = curr_pose.reshape(-1, 7, 1)[:, :2].mean(dim=0, keepdim=True)
-        snapped_com = snap_to_grid_torch(start_com, self.grid_step, self.boundary)
-        cost_grid = self.cost_weights[0] * self.dist_cost_grid + self.cost_weights[2] * self.obs_cost_grid
-        best_pt = unsnap_to_grid_torch(
-            heuristic_dir2(cost_grid, snapped_com, 2),
-            self.grid_step,
-            self.boundary
-        )
+
+        try:
+            snapped_com = mppi_utils.snap_to_grid_torch(start_com, self.grid_step, self.boundary)
+            best_pt = mppi_utils.unsnap_to_grid_torch(
+                mppi_utils.heuristic_dir_r2(self.dist_cost_grid, snapped_com, 6),
+                self.grid_step[:2],
+                self.boundary
+            )
+        except:
+            print("Error in get_goal_dir, return goal as best point")
+            best_pt = self.goal[:, :2].flatten().cpu().numpy().tolist()
+
         curr_dir = torch.hstack([best_pt[0] - start_com[:, :1], best_pt[1] - start_com[:, 1:2]])
         curr_dir = curr_dir / curr_dir.norm(dim=1, keepdim=True)
         return curr_dir
@@ -916,7 +882,6 @@ class TensegrityMPPIPlanner(torch.nn.Module):
             cost_total_non_zero = self._compute_weight(costs, beta, 0.)
             eta = torch.sum(cost_total_non_zero)
             omega = ((1. / eta) * cost_total_non_zero).reshape(-1, 1, 1)
-            # print(omega.device, batch_actions.device)
             min_actions = (omega * batch_actions.cpu()).sum(dim=0, keepdim=True)
 
             device = self.device
@@ -931,7 +896,6 @@ class TensegrityMPPIPlanner(torch.nn.Module):
             other_cost = [(self.gamma_seq * torch.vstack(c)).sum(dim=0).mean().cpu().item()
                           for c in min_other_costs]
             cost = (self.gamma_seq * torch.vstack(min_costs)).sum(dim=0).mean().cpu().item()
-            # cost = self.weights[0] * dist_c + self.weights[1] * dir_c + self.weights[2] * obs_c
 
             self.to(device)
         else:
@@ -940,11 +904,9 @@ class TensegrityMPPIPlanner(torch.nn.Module):
 
             min_actions = batch_actions[idx: idx + 1]
             min_act_states = batch_states[idx: idx + 1]
-            other_cost = [c[self.act_interval - 1][idx].cpu().item()
-                          for c in other_costs]
-            cost = costs[self.act_interval - 1][idx].cpu().item()
+            other_cost = [c[-1][idx].cpu().item() for c in other_costs]
+            cost = costs[-1][idx].cpu().item()
 
-        self.logger.info(f"Total: {cost}, "
-                         f"Other: {other_cost}")
+        self.logger.info(f"Total: {cost}, Other: {other_cost}")
 
         return min_actions, min_act_states, batch_states

@@ -6,10 +6,11 @@ Code for the paper:
 
 ## Create virtual env
 
-``conda create --name cable_robot_gnn python=3.10
+```
+conda create --name cable_robot_gnn python=3.10
 conda activate cable_robot_gnn
 pip install -r requirements.txt
-``
+```
 
 ## Download dataset
 
@@ -44,22 +45,18 @@ There are two config json files relevant for simulation and training:
 2. `simulators/configs/*`   <--- json files that specify simulation and robot parameters and configuration
 
 
-## Miscellaneous
-
-- Default tensor precision is float32. Although this is often good enough and train/run faster, 
-switch `DEFAULT_DTYPE` to float64 in `utilties/misc_utils` for more accuracy and stability.
-
 ## If this work was useful for your research, please cite:
 
 ```angular2html
-<!--@misc{chen2024learningdifferentiabletensegritydynamics,-->
-<!--      title={Learning Differentiable Tensegrity Dynamics using Graph Neural Networks}, -->
-<!--      author={Nelson Chen and Kun Wang and William R. Johnson III au2 and Rebecca Kramer-Bottiglio and Kostas Bekris and Mridul Aanjaneya},-->
-<!--      year={2024},-->
-<!--      eprint={2410.12216},-->
-<!--      archivePrefix={arXiv},-->
-<!--      primaryClass={cs.RO},-->
-<!--      url={https://arxiv.org/abs/2410.12216}, -->
-<!--}-->
+@article{chen2026cablerobotgraphsim,
+  title   = {CableRobotGraphSim: A Graph Neural Network for
+             Modeling Partially Observable Cable-Driven
+             Robot Dynamics},
+  author  = {Chen, Nelson and Johnson III, William R. and
+             Kramer-Bottiglio, Rebecca and Bekris, Kostas and
+             Aanjaneya, Mridul},
+  journal = {arXiv preprint arXiv:2602.21331},
+  year    = {2026}
+}
 ```
 
