@@ -40,7 +40,10 @@ def train():
         save_code = False
         trainer = TensegrityMultiSimMultiStepMotorGNNTrainingEngine(cfg, logger)
 
-        trainer.to('cuda:0')
+        if torch.cuda.is_available():
+            trainer.to('cuda:0')
+        else:
+            trainer.to('cpu')
         trainer.run(e)
 
         output_dir = Path(cfg['output_path'])
