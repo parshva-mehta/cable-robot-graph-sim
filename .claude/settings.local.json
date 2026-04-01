@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l *.py gnn_physics/*.py nn_training/*.py simulators/*.py robots/*.py state_objects/*.py actuation/*.py utilities/*.py mujoco_physics_engine/*.py)",
+      "Bash(grep -E \"\\\\.py$\")"
+    ]
+  }
+}
