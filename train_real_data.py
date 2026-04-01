@@ -35,7 +35,8 @@ def train():
         load_sim, batch_sizes, eval_steps,
         mix_ratios, dt_deltas, vel_min_dts
     ))
-    for n, e, lr, load, batch_size, eval_step, mix_r, dt_d, vm_dt in params[:]:
+    total_runs = len(params)
+    for run_idx, (n, e, lr, load, batch_size, eval_step, mix_r, dt_d, vm_dt) in enumerate(params[:], start=1):
         config_file['target_dt'] = n
         config_file['optimizer_params']['lr'] = lr
         config_file['load_sim'] = load
@@ -45,12 +46,46 @@ def train():
         config_file['eval_step_size'] = eval_step
         config_file['vel_min_dt'] = vm_dt
 
+        print(
+            "\n========== Training run {}/{} ==========\n"
+            "Model set: target_dt={}\n"
+            "Epochs: {}\n"
+            "LR: {}\n"
+            "Batch size per step/update: {}/{}\n"
+            "Eval step size: {}\n"
+            "Load sim data: {}\n"
+            "Mix ratio (real/sim): {}\n"
+            "dt_delta: {}\n"
+            "vel_min_dt: {}\n"
+            "Output path: {}\n"
+            "=======================================".format(
+                run_idx,
+                total_runs,
+                n,
+                e,
+                lr,
+                batch_size,
+                config_file.get('batch_size_per_update', '<unset>'),
+                eval_step,
+                load,
+                mix_r,
+                dt_d,
+                vm_dt,
+                config_file.get('output_path', '<unset>'),
+            ),
+            flush=True,
+        )
         trainer = RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(
             config_file,
             logger
         )
 
-        trainer.to('cuda:0')
+        if torch.cuda.is_available():
+            trainer.to('cuda:0')
+            print("Using GPU: {}".format(torch.cuda.get_device_name(0)), flush=True)
+        else:
+            trainer.to('cpu')
+            print("CUDA unavailable. Using CPU.", flush=True)
         trainer.run(e)
 
         output_dir = Path(config_file['output_path'])

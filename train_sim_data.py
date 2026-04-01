@@ -28,7 +28,8 @@ def train():
     eval_steps = [25, 25, 20, 20, 10, 5, 3]
 
     params = list(zip(num_steps, epochs, learning_rates, load_sim, batch_sizes, eval_steps))
-    for n, e, lr, load, batch_size, eval_step in params[:]:
+    total_runs = len(params)
+    for run_idx, (n, e, lr, load, batch_size, eval_step) in enumerate(params[:], start=1):
         cfg['num_steps_fwd'] = n
         cfg['optimizer_params']['lr'] = lr
         cfg['load_sim'] = load
@@ -38,12 +39,36 @@ def train():
         cfg['eval_step_size'] = eval_step
 
         save_code = False
+        print(
+            "\n========== Training run {}/{} ==========\n"
+            "Model set: {}-step forward\n"
+            "Epochs: {}\n"
+            "LR: {}\n"
+            "Batch size per step/update: {}\n"
+            "Eval step size: {}\n"
+            "Load sim data: {}\n"
+            "Output path: {}\n"
+            "=======================================".format(
+                run_idx,
+                total_runs,
+                n,
+                e,
+                lr,
+                batch_size,
+                eval_step,
+                load,
+                cfg.get('output_path', '<unset>'),
+            ),
+            flush=True,
+        )
         trainer = TensegrityMultiSimMultiStepMotorGNNTrainingEngine(cfg, logger)
 
         if torch.cuda.is_available():
             trainer.to('cuda:0')
+            print("Using GPU: {}".format(torch.cuda.get_device_name(0)), flush=True)
         else:
             trainer.to('cpu')
+            print("CUDA unavailable. Using CPU.", flush=True)
         trainer.run(e)
 
         output_dir = Path(cfg['output_path'])
