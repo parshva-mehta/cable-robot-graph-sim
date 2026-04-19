@@ -256,9 +256,24 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
 
         return data_act_lens
 
+    def _make_checkpoint(self) -> dict:
+        return {
+            'state_dict': self.simulator.state_dict(),
+            'gnn_params': self.sim_config['gnn_params'],
+            'tensegrity_cfg': self.sim_config['tensegrity_cfg'],
+            'num_datasets': self.num_datasets,
+            'num_ctrls_hist': self.sim_config['num_ctrls_hist'],
+            'dt': self.sim_config['dt'],
+        }
+
     def _get_simulator(self):
+        from simulators.tensegrity_gnn_simulator import load_simulator
         if self.load_sim and self.load_sim_path:
-            sim = torch.load(self.load_sim_path, map_location="cpu", weights_only=False)
+            sim = load_simulator(
+                self.load_sim_path,
+                map_location='cpu',
+                cache_batch_sizes=[self.batch_size_per_step],
+            )
             sim.reset()
             sim.cpu()
             print("Loaded simulator")
@@ -606,19 +621,19 @@ class TensegrityMultiSimMultiStepMotorGNNTrainingEngine(nn.Module):
         if -9. < val_losses[0] < self.best_val_loss:
             self.best_val_loss = val_losses[0]
             torch.save(
-                self.simulator,
+                self._make_checkpoint(),
                 Path(self.output_dir, "best_loss_model.pt")
             )
         if -9. < val_rollout_loss < self.best_rollout_loss:
             self.best_rollout_loss = val_rollout_loss
             torch.save(
-                self.simulator,
+                self._make_checkpoint(),
                 Path(self.output_dir, "best_rollout_model.pt")
             )
         if -9. < val_n_steps_loss < self.best_n_step_rollout_loss:
             self.best_n_step_rollout_loss = val_n_steps_loss
             torch.save(
-                self.simulator,
+                self._make_checkpoint(),
                 Path(self.output_dir, "best_n_step_rollout_model.pt")
             )
 
