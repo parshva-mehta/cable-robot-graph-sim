@@ -11,9 +11,13 @@ np.set_printoptions(precision=64)
 
 def train():
     config_file_path = "nn_training/configs/3_bar_real_train_config.json"
+    if Path(config_file_path).is_absolute():
+        raise ValueError(f"config_file_path must be relative: {config_file_path}")
     with open(config_file_path, 'r') as j:
         config_file = json.load(j)
 
+    if Path(config_file['output_path']).is_absolute():
+        raise ValueError(f"output_path must be relative: {config_file['output_path']}")
     Path(config_file['output_path']).mkdir(exist_ok=True)
     logger = setup_logger(config_file['output_path'])
 

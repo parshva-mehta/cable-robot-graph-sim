@@ -1,10 +1,11 @@
 dm-control
 flatten-dict
 mujoco
-numpy
+numpy<2
 numpy-quaternion
 opencv-python
 Pillow
 torch
 torch-geometric
 tqdm
+gtsam

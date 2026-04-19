@@ -740,7 +740,7 @@ class GraphDataProcessor(BaseStateObject):
         z_dir = torch.tensor(
             [[0, 0, 1]],
             dtype=self.dtype,
-            device=self.device
+            device=node_pos.device
         ).repeat(x_dir.shape[0], 1)
         y_dir = torch.cross(z_dir, x_dir, dim=1)
         y_dir = safe_norm(y_dir)
@@ -814,7 +814,7 @@ class GraphDataProcessor(BaseStateObject):
 
         # Post ground node
         grnd_ten1 = zeros((1, 3), ref_tensor=node_pos)
-        grnd_ten2 = torch.tensor([0., 0., 1.], dtype=self.dtype, device=self.device)
+        grnd_ten2 = torch.tensor([0., 0., 1.], dtype=self.dtype, device=node_pos.device)
 
         node_pos = self._inject_grnd_feat(node_pos, grnd_ten1)
         node_vels = self._inject_grnd_feat(node_vels, grnd_ten1)
@@ -866,9 +866,12 @@ class GraphDataProcessor(BaseStateObject):
         vecs = torch.zeros(
             (batch_idxs.shape[0], self.NUM_DATASETS),
             dtype=self.dtype,
-            device=self.device
+            device=batch_idxs.device
         )
-        vecs[torch.arange(batch_idxs.shape[0], dtype=torch.int), batch_idxs.flatten()] = 1.
+        vecs[
+            torch.arange(batch_idxs.shape[0], dtype=torch.int, device=batch_idxs.device),
+            batch_idxs.flatten()
+        ] = 1.
 
         return vecs
 

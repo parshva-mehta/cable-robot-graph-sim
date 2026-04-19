@@ -1,5 +1,6 @@
 import math
-from typing import List, Dict
+from pathlib import Path
+from typing import List, Dict, Union
 
 import torch
 import tqdm
@@ -9,6 +10,32 @@ from gnn_physics.data_processors.graph_data_processor import GraphDataProcessor
 from gnn_physics.gnn import EncodeProcessDecode, RecurrentType
 from robots.tensegrity import TensegrityRobotGNN
 from simulators.abstract_simulator import LearnedSimulator
+
+
+def load_simulator(
+    path: Union[str, Path],
+    map_location=None,
+    cache_batch_sizes: List[int] | None = None,
+) -> 'TensegrityGNNSimulator':
+    """Load a TensegrityGNNSimulator from a checkpoint.
+
+    Handles both the legacy format (raw pickled simulator object) and the
+    current format (dict with ``state_dict`` + config metadata).
+    """
+    checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        sim = TensegrityGNNSimulator(
+            gnn_params=checkpoint['gnn_params'],
+            tensegrity_cfg=checkpoint['tensegrity_cfg'],
+            num_datasets=checkpoint.get('num_datasets', 10),
+            num_ctrls_hist=checkpoint.get('num_ctrls_hist', 20),
+            dt=checkpoint.get('dt', 0.01),
+            cache_batch_sizes=cache_batch_sizes,
+        )
+        sim.load_state_dict(checkpoint['state_dict'])
+    else:
+        sim = checkpoint
+    return sim
 
 
 class TensegrityGNNSimulator(LearnedSimulator):
