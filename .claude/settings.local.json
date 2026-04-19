@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Bash(wc -l *.py gnn_physics/*.py nn_training/*.py simulators/*.py robots/*.py state_objects/*.py actuation/*.py utilities/*.py mujoco_physics_engine/*.py)",
-      "Bash(grep -E \"\\\\.py$\")"
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(git checkout:*)",
+      "Bash(python3 *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(conda run *)",
+      "Bash(python -c \"import sys; print\\(sys.path\\)\")",
+      "Bash(conda info *)",
+      "Bash(python *)",
+      "Bash(/opt/homebrew/Caskroom/miniconda/base/envs/cable_robot_gnn/bin/python *)",
+      "Bash(/opt/homebrew/Caskroom/miniconda/base/envs/cable_robot_gnn/bin/pip show *)"
     ]
   }
 }

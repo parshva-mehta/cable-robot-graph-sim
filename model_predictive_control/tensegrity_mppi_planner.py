@@ -16,6 +16,7 @@ from torch.distributions import Uniform
 from model_predictive_control.mppi_utils import wave_heuristic_dict_to_arr, snap_to_grid_torch, unsnap_to_grid_torch, \
     heuristic_dir2, fill_grid
 from simulators.abstract_simulator import AbstractSimulator
+from simulators.tensegrity_gnn_simulator import load_simulator
 from utilities import torch_quaternion
 
 
@@ -80,7 +81,7 @@ class TensegrityMPPIPlanner(torch.nn.Module):
         self.logger = logger
 
         if isinstance(sim, str) or isinstance(sim, Path):
-            self.sim = torch.load(sim, map_location='cpu', weights_only=False)
+            self.sim = load_simulator(sim, map_location='cpu', cache_batch_sizes=[1])
             self.sim.to(device)
         else:
             self.sim = sim
