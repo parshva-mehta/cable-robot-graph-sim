@@ -15,6 +15,7 @@ import torch
 import tqdm
 
 import gtsam
+# import _numpy_kf as gtsam  # Fallback disabled: enforce GTSAM backend.
 
 from linearization import (
     _build_quat_E_matrix,       # noqa: F401  (re-exported for callers)

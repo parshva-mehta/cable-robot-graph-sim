@@ -20,6 +20,7 @@ import torch
 import tqdm
 
 import gtsam
+# import _numpy_kf as gtsam  # Fallback disabled: enforce GTSAM backend.
 
 from ekf import _control_to_numpy_vector, _ensure_ctrl_for_step, _reinit_state_jitter
 from linearization_exp import (
@@ -27,7 +28,6 @@ from linearization_exp import (
     EXP_STATE_DIM,
     quat_state_to_exp_state,
     exp_state_to_quat_state,
-    step_exp,
     linearize_dynamics_exp,
 )
 from utilities.misc_utils import DEFAULT_DTYPE
@@ -157,25 +157,16 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
     state_dim = EXP_STATE_DIM
     x_mean = np.array(state_gtsam.mean()).reshape(-1).astype(np.float64)
 
-    # --- 36×36 Jacobian — no rank fix needed ---------------------------------
-    _, F_np = linearize_dynamics_exp(
+    # --- 36×36 Jacobian + nominal next state (actual controls) ---------------
+    next_state_0_np, F_np = linearize_dynamics_exp(
         simulator, state_exp_t,
         sample_index=dataset_idx_val,
         use_finite_diff=use_finite_diff,
+        ctrls=ctrl,
     )
 
     if not np.all(np.isfinite(F_np)):
         F_np = np.eye(state_dim, dtype=np.float64)
-
-    # --- Nominal next state with actual controls (in exp-map space) ----------
-    device = state_exp_t.device
-    dtype  = state_exp_t.dtype
-    s2g_kwargs = {'dataset_idx': torch.tensor([[dataset_idx_val]],
-                                               dtype=torch.long, device=device)}
-    with torch.no_grad():
-        next_exp_t = step_exp(simulator, state_exp_t, ctrls=ctrl,
-                              s2g_kwargs=s2g_kwargs)
-    next_state_0_np = next_exp_t[0, :state_dim, 0].cpu().numpy().astype(np.float64)
 
     Q_sigmas_safe = np.maximum(Q_sigmas, 1e-6)
     F_cont = np.ascontiguousarray(F_np, dtype=np.float64)

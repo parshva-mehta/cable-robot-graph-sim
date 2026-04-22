@@ -120,12 +120,13 @@ def linearize_dynamics_exp(
     state_exp,
     sample_index: int = 0,
     use_finite_diff: bool = False,
+    ctrls=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Linearize the exp-map-wrapped one-step dynamics at *state_exp*.
 
     Returns
     -------
-    next_state_exp : (36,) float64 ndarray
+    next_state_exp : (36,) float64 ndarray  — computed with *ctrls* (or zero if None)
     J_exp          : (36, 36) float64 ndarray — naturally full-rank
     """
     if isinstance(state_exp, torch.Tensor):
@@ -143,11 +144,12 @@ def linearize_dynamics_exp(
     dataset_idx = torch.tensor([[sample_index]], dtype=torch.long, device=dev)
     s2g_kwargs  = {'dataset_idx': dataset_idx}
     ctrls_t     = _build_zero_ctrls(model, dtype, dev)
+    nominal_ctrls = ctrls if ctrls is not None else ctrls_t
 
-    def _fwd_np(x_np: np.ndarray) -> np.ndarray:
+    def _fwd_np(x_np: np.ndarray, c=ctrls_t) -> np.ndarray:
         x_t = torch.tensor(x_np, dtype=dtype, device=dev).reshape(1, EXP_STATE_DIM, 1)
         with torch.no_grad():
-            ns = step_exp(model, x_t, ctrls_t, s2g_kwargs)
+            ns = step_exp(model, x_t, c, s2g_kwargs)
         return ns[0, :EXP_STATE_DIM, 0].detach().cpu().numpy().astype(np.float64)
 
     if not use_finite_diff:
@@ -161,7 +163,7 @@ def linearize_dynamics_exp(
         J_np     = torch.func.jacrev(step_fn)(state_in).detach().cpu().numpy().astype(np.float64)
 
         _restore_model_ctx(model, ctx)
-        next_state_np = _fwd_np(state_exp_np)
+        next_state_np = _fwd_np(state_exp_np, nominal_ctrls)
 
     else:
         eps_pos = 1e-4
@@ -170,7 +172,7 @@ def linearize_dynamics_exp(
         J_np = np.zeros((EXP_STATE_DIM, EXP_STATE_DIM), dtype=np.float64)
 
         _restore_model_ctx(model, ctx)
-        next_state_np = _fwd_np(state_exp_np)
+        next_state_np = _fwd_np(state_exp_np, nominal_ctrls)
 
         for j in range(EXP_STATE_DIM):
             off = j % EXP_BLOCK_SIZE
