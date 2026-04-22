@@ -8,4 +8,6 @@ Pillow
 torch
 torch-geometric
 tqdm
-gtsam
+# GTSAM (eval.py --mode ekf / ekf_exp): PyPI has no Windows wheels; use conda:
+#   conda install -c conda-forge gtsam
+# Linux/macOS may use: pip install gtsam

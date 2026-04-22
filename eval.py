@@ -15,6 +15,28 @@ from simulators.tensegrity_gnn_simulator import TensegrityGNNSimulator, load_sim
 from utilities import torch_quaternion
 from utilities.misc_utils import DEFAULT_DTYPE
 
+mac_path = {
+    "data_dir": (
+        "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/"
+        "3bar_new_platform_high_friction/dataset_0/traj_6"
+    ),
+    "model_path": (
+        "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/"
+        "best_rollout_model.pt"
+    ),
+}
+windows_path = {
+    "data_dir": (
+        r"C:\Users\parshva-mehta\OneDrive\Documents\Projects\PRACSYS\Tensegrity"
+        r"\tensegrity\data_sets\3bar_new_platform_high_friction\dataset_0\traj_6"
+    ),
+    "model_path": (
+        r"C:\Users\parshva-mehta\OneDrive\Documents\Projects\PRACSYS\Tensegrity"
+        r"\tensegrity\models\best_n_step_rollout_model.pt"
+    ),
+}
+_default_eval_paths = windows_path if os.name == "nt" else mac_path
+
 
 def rollout_by_ctrls(simulator,
                      ctrls,
@@ -209,10 +231,10 @@ def batch_compute_end_pts(sim, batch_state: torch.Tensor):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str,
-                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+                        default=_default_eval_paths["model_path"],
                         help='Path to trained .pt model file')
     parser.add_argument('--data_dir', type=str,
-                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        default=_default_eval_paths["data_dir"],
                         help='Directory with processed_data.json and extra_state_data.json')
     parser.add_argument('--output', type=str, default=None,
                         help='Output rollout text file (default derived from --mode)')
