@@ -9,3 +9,4 @@ torch
 torch-geometric
 tqdm
 gtsam
+matplotlib
