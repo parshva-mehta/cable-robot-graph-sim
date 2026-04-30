@@ -4,12 +4,51 @@ from typing import List, Dict, Union
 
 import torch
 import tqdm
+from torch import nn
 from torch_geometric.data import Data as GraphData
 
 from gnn_physics.data_processors.graph_data_processor import GraphDataProcessor
 from gnn_physics.gnn import EncodeProcessDecode, RecurrentType
+from gnn_physics.scriptable_gnn import (
+    ScriptableEncodeProcessDecode,
+    unpack_graph,
+)
 from robots.tensegrity import TensegrityRobotGNN
 from simulators.abstract_simulator import LearnedSimulator
+
+
+class _GraphDataAdaptedScriptable(nn.Module):
+    """Wraps ScriptableEncodeProcessDecode so it can stand in for the original
+    EncodeProcessDecode inside TensegrityGNNSimulator (which speaks GraphData).
+
+    This wrapper itself is intentionally NOT scripted; it bridges GraphData I/O
+    in Python while delegating the heavy lifting to a scriptable inner model
+    that can be exported via torch.jit.script for libtorch consumption.
+    """
+
+    def __init__(self, scriptable: ScriptableEncodeProcessDecode):
+        super().__init__()
+        self.scriptable = scriptable
+
+    def forward(self, graph):
+        (node_x,
+         body_e, body_idx,
+         cable_e, cable_idx,
+         contact_e, contact_idx,
+         hidden) = unpack_graph(graph)
+        decode_output, cable_decode_output, new_hidden = self.scriptable(
+            node_x,
+            body_e, body_idx,
+            cable_e, cable_idx,
+            contact_e, contact_idx,
+            hidden,
+        )
+        graph['decode_output'] = decode_output
+        if cable_decode_output is not None:
+            graph['cable_decode_output'] = cable_decode_output
+        if new_hidden is not None:
+            graph['node_hidden_state'] = new_hidden
+        return graph
 
 
 def load_simulator(
@@ -47,9 +86,11 @@ class TensegrityGNNSimulator(LearnedSimulator):
             dt=0.01,
             num_datasets: int = 10,
             num_ctrls_hist: int = 20,
-            cache_batch_sizes: List[int] | None = None
+            cache_batch_sizes: List[int] | None = None,
+            use_scriptable_gnn: bool = False,
     ):
         self.use_cable_decoder = gnn_params['use_cable_decoder']
+        self.use_scriptable_gnn = use_scriptable_gnn
 
         self.num_out_steps = gnn_params['n_fwd_pred_steps']
         self.num_ctrls_hist = num_ctrls_hist
@@ -101,6 +142,20 @@ class TensegrityGNNSimulator(LearnedSimulator):
         self.node_hidden_state = kwargs.get('node_hidden_state', None)
 
     def _build_gnn(self, **kwargs):
+        if getattr(self, 'use_scriptable_gnn', False):
+            scriptable = ScriptableEncodeProcessDecode(
+                node_types=kwargs['node_types'],
+                edge_types=kwargs['edge_types'],
+                n_out=kwargs['n_out'] * kwargs['n_fwd_pred_steps'],
+                latent_dim=kwargs['latent_dim'],
+                nmessage_passing_steps=kwargs['nmessage_passing_steps'],
+                nmlp_layers=kwargs['nmlp_layers'],
+                mlp_hidden_dim=kwargs['mlp_hidden_dim'],
+                processor_shared_weights=kwargs['processor_shared_weights'],
+                recurrent_type=kwargs['recurrent_type'],
+                use_cable_decoder=kwargs['use_cable_decoder'],
+            )
+            return _GraphDataAdaptedScriptable(scriptable)
         return EncodeProcessDecode(
             node_types=kwargs['node_types'],
             edge_types=kwargs['edge_types'],
