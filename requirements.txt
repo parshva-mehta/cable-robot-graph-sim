@@ -6,7 +6,6 @@ numpy-quaternion
 opencv-python
 Pillow
 torch
-torch-geometric
 tqdm
 # GTSAM (eval.py --mode ekf / ekf_exp): PyPI has no Windows wheels; use conda:
 #   conda install -c conda-forge gtsam
