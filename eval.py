@@ -209,10 +209,13 @@ def batch_compute_end_pts(sim, batch_state: torch.Tensor):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str,
-                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+#                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
+
                         help='Path to trained .pt model file')
     parser.add_argument('--data_dir', type=str,
-                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        #default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
                         help='Directory with processed_data.json and extra_state_data.json')
     parser.add_argument('--output', type=str, default=None,
                         help='Output rollout text file (default derived from --mode)')
@@ -221,10 +224,14 @@ def main():
                         help='raw: pure GNN rollout; ekf: quat-space EKF; ekf_exp: exp-map EKF')
     parser.add_argument('--dt', type=float, default=0.01,
                         help='Timestep used by EKF modes')
-    parser.add_argument('--process_noise', type=float, default=1e-4)
-    parser.add_argument('--measurement_noise', type=float, default=1e-3)
-    parser.add_argument('--observe_pose_only', action='store_true')
-    parser.add_argument('--innovation_gate', type=float, default=float('inf'))
+    parser.add_argument('--process_noise', type=float, default=1e-6,
+                        help='Q scale: small = trust GNN model strongly (stable)')
+    parser.add_argument('--measurement_noise', type=float, default=1e-1,
+                        help='R scale: large = low Kalman gain, fewer jumps')
+    parser.add_argument('--observe_pose_only', action='store_true', default=True,
+                        help='Observe only pose (pos+quat); skip velocities')
+    parser.add_argument('--innovation_gate', type=float, default=3.0,
+                        help='Reject updates with ||innovation|| > gate*sqrt(meas_dim)')
     parser.add_argument('--dataset_idx', type=int, default=9)
     args = parser.parse_args()
 

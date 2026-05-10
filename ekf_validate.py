@@ -26,6 +26,21 @@ from ekf import OnlineEKF, run_ekf_rollout, _structured_Q_sigmas, _structured_R_
 from utilities.misc_utils import DEFAULT_DTYPE
 
 
+def _json_sanitize(obj):
+    """Recursively convert numpy scalars/arrays to native Python for json.dump."""
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_sanitize(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_json_sanitize(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
 def plot_residuals(innovations, output_dir="ekf_validation"):
     """Plot innovation sequence and check for white noise properties."""
     Path(output_dir).mkdir(exist_ok=True)
@@ -250,8 +265,14 @@ def validate_ekf(model_path, data_path, extra_data_path,
         for k, extra in enumerate(tqdm.tqdm(extra_data)):
             ctrl = torch.tensor(extra['controls'], dtype=dtype, device=device).reshape(1, -1, 1)
             s2g_kwargs = {'dataset_idx': torch.tensor([[9]], dtype=torch.long, device=device)}
-            out = simulator.step(curr_state, ctrls=ctrl, state_to_graph_kwargs=s2g_kwargs)
-            curr_state = out[0] if isinstance(out, tuple) else out
+            # Match TensegrityGNNSimulator.run: state must be [batch, 13*n_rods, 1].
+            # step() returns [batch, 13*n_rods, n_fwd_pred_steps]; folding that entire
+            # tensor into pose2node breaks (wrong reshape vs body_verts batch).
+            out = simulator.step(
+                curr_state[..., -1:], ctrls=ctrl, state_to_graph_kwargs=s2g_kwargs
+            )
+            next_state = out[0] if isinstance(out, tuple) else out
+            curr_state = next_state[..., -1:]
             gnn_states.append(curr_state.detach().clone())
 
     # Reset simulator
@@ -375,17 +396,19 @@ def validate_ekf(model_path, data_path, extra_data_path,
         'performance': perf,
     }
     with open(f'{output_dir}/summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(_json_sanitize(summary), f, indent=2)
     print(f"\nDetailed results saved to {output_dir}/summary.json")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str,
-                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+                        #default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
                         help='Path to trained .pt model file')
     parser.add_argument('--data_dir', type=str,
-                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        #default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
                         help='Directory with processed_data.json and extra_state_data.json')
     parser.add_argument('--process-noise', type=float, default=1e-4)
     parser.add_argument('--measurement-noise', type=float, default=1e-3)

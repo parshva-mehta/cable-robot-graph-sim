@@ -15,13 +15,14 @@ import torch
 import tqdm
 
 import gtsam
-# import _numpy_kf as gtsam  # Fallback disabled: enforce GTSAM backend.
 
 from linearization import (
     _build_quat_E_matrix,       # noqa: F401  (re-exported for callers)
     _build_tangent_projections,  # noqa: F401
     _fix_jacobian_quaternion_rank,
     linearize_dynamics,
+    _save_model_ctx,
+    _restore_model_ctx,
 )
 from utilities.misc_utils import DEFAULT_DTYPE
 
@@ -46,12 +47,49 @@ def _renormalize_quats_numpy(mean: np.ndarray, n_rods: int) -> None:
 # GTSAM helpers
 # ---------------------------------------------------------------------------
 
-def _reinit_state_jitter(kf, state, state_dim, jitter=1e-8):
-    """Symmetrize covariance, add jitter, and re-init the GTSAM filter state."""
+def _make_pd(P: np.ndarray, min_eig: float = 1e-6) -> np.ndarray:
+    """Return a symmetric positive-definite version of P via eigenvalue clamping.
+
+    Symmetrizes first, then clamps all eigenvalues to at least min_eig.
+    This handles any degree of ill-conditioning or small negative eigenvalues
+    without inflating well-conditioned directions.
+    """
+    P_sym = 0.5 * (P + P.T)
+    eigvals, eigvecs = np.linalg.eigh(P_sym)
+    eigvals = np.maximum(eigvals, min_eig)
+    return (eigvecs * eigvals) @ eigvecs.T
+
+
+_MAX_COV_EIG = 1e8
+
+
+def _make_pd_bounded(P: np.ndarray,
+                     min_eig: float = 1e-6,
+                     max_eig: float = _MAX_COV_EIG) -> np.ndarray:
+    """Symmetric PD projection with eigenvalue clamping in [min_eig, max_eig].
+
+    The upper bound prevents covariance blow-up from causing GTSAM numerical
+    failures (GTSAM stores the information matrix P^{-1}; large P eigenvalues
+    map to near-zero information eigenvalues which trigger IndeterminantLinearSystem).
+    Falls back to scaled identity if P contains NaN/Inf.
+    """
+    n = P.shape[0]
+    if not np.all(np.isfinite(P)):
+        return np.eye(n, dtype=np.float64) * min_eig
+    P_sym = 0.5 * (P + P.T)
+    eigvals, eigvecs = np.linalg.eigh(P_sym)
+    if not np.all(np.isfinite(eigvals)):
+        return np.eye(n, dtype=np.float64) * min_eig
+    eigvals = np.clip(eigvals, min_eig, max_eig)
+    return (eigvecs * eigvals) @ eigvecs.T
+
+
+def _reinit_state_jitter(kf, state, state_dim, jitter=1e-6):
+    """Clamp covariance eigenvalues to [jitter, MAX_COV_EIG] and re-init the GTSAM filter state."""
     mean_col = np.asarray(state.mean(), dtype=np.float64).reshape(state_dim, 1)
     P = np.asarray(state.covariance(), dtype=np.float64)
-    P_sym = 0.5 * (P + P.T) + jitter * np.eye(state_dim, dtype=np.float64)
-    return kf.init(mean_col, P_sym)
+    P_pd = _make_pd_bounded(P, min_eig=jitter)
+    return kf.init(mean_col, P_pd)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +248,12 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     state_dim = state_torch.numel()
     x_mean = np.array(state_gtsam.mean()).reshape(-1).astype(np.float64)
 
+    # Save simulator context (LSTM hidden state + cable state) before any
+    # forward passes.  After the update step the LSTM will be re-advanced from
+    # the posterior mean instead of the prior, keeping GNN dynamics consistent
+    # with the filtered state.
+    ctx_pre = _save_model_ctx(simulator)
+
     # --- Jacobian F from linearize_dynamics (uses zero controls internally) ---
     _, F_np = linearize_dynamics(
         simulator, state_torch,
@@ -235,6 +279,28 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     next_state_0_np = full_next[0, :state_dim, 0].cpu().numpy().astype(np.float64)
 
     Q_sigmas_safe = np.maximum(Q_sigmas, 1e-6)
+
+    # --- Adaptive Q: inflate process noise when measurement is far from the
+    # current estimate.  Uses prior x_mean for sign-flip to avoid needing the
+    # predict mean.  A large innovation signals model mismatch (e.g., LSTM
+    # drift), so we increase uncertainty to let measurements correct faster.
+    if have_measurement and z_np is not None:
+        z_tmp = z_np.reshape(-1).copy()
+        if z_tmp.size == 7 * n_rods:
+            for r in range(n_rods):
+                if np.dot(x_mean[13*r+3:13*r+7], z_tmp[7*r+3:7*r+7]) < 0:
+                    z_tmp[7*r+3:7*r+7] *= -1
+        elif z_tmp.size == 13 * n_rods:
+            for r in range(n_rods):
+                if np.dot(x_mean[13*r+3:13*r+7], z_tmp[13*r+3:13*r+7]) < 0:
+                    z_tmp[13*r+3:13*r+7] *= -1
+        prior_innov_norm = np.linalg.norm(z_tmp - H_np @ x_mean)
+        r_rms = np.sqrt(np.mean(np.maximum(R_sigmas, 1e-6)**2))
+        threshold = 3.0 * r_rms * np.sqrt(float(z_tmp.size))
+        if prior_innov_norm > threshold:
+            inflate = min((prior_innov_norm / threshold)**2, 10.0)
+            Q_sigmas_safe = Q_sigmas_safe * np.sqrt(inflate)
+
     F_cont = np.ascontiguousarray(F_np, dtype=np.float64)
     u_np = _control_to_numpy_vector(ctrl)
 
@@ -284,18 +350,35 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
         P_pred = np.asarray(state_pred.covariance(), dtype=np.float64)
     except RuntimeError:
         P_pred = np.eye(state_dim, dtype=np.float64) * float(np.mean(Q_sigmas_safe**2))
-    P_sym = 0.5 * (P_pred + P_pred.T) + 1e-8 * np.eye(state_dim, dtype=np.float64)
-    state_pred = kf.init(mean_pred.reshape(state_dim, 1), P_sym)
+    state_pred = kf.init(mean_pred.reshape(state_dim, 1), _make_pd_bounded(P_pred))
 
-    innovation = z_np.reshape(-1) - (H_np @ mean_pred)
+    # Flip measurement quaternion signs to match the predicted hemisphere before
+    # computing the innovation.  A linear update with a sign-flipped quaternion
+    # produces an innovation of ~2, which causes large erratic jumps.
+    meas_size = z_np.size
+    z_adj = z_np.reshape(-1).copy()
+    if meas_size == 7 * n_rods:
+        for r in range(n_rods):
+            pred_q = mean_pred[13 * r + 3 : 13 * r + 7]
+            meas_q = z_adj[7 * r + 3 : 7 * r + 7]
+            if np.dot(pred_q, meas_q) < 0:
+                z_adj[7 * r + 3 : 7 * r + 7] = -meas_q
+    elif meas_size == 13 * n_rods:
+        for r in range(n_rods):
+            pred_q = mean_pred[13 * r + 3 : 13 * r + 7]
+            meas_q = z_adj[13 * r + 3 : 13 * r + 7]
+            if np.dot(pred_q, meas_q) < 0:
+                z_adj[13 * r + 3 : 13 * r + 7] = -meas_q
+
+    innovation = z_adj - (H_np @ mean_pred)
     if (np.isfinite(innovation_gate_sigma) and
             np.linalg.norm(innovation) > innovation_gate_sigma * np.sqrt(innovation.size)):
         mean_for_output = mean_pred.copy()
         _renormalize_quats_numpy(mean_for_output, n_rods)
         return mean_for_output, state_pred
 
-    meas_dim = z_np.size
-    z_col = np.asarray(z_np, dtype=np.float64).reshape(meas_dim, 1)
+    meas_dim = meas_size
+    z_col = z_adj.reshape(meas_dim, 1)
     R_sigmas_safe = np.maximum(R_sigmas, 1e-6)
     model_r = gtsam.noiseModel.Diagonal.Sigmas(R_sigmas_safe)
     state_post = kf.update(state_pred,
@@ -304,6 +387,26 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     state_post = _reinit_state_jitter(kf, state_post, state_dim)
     mean_np = np.array(state_post.mean()).reshape(-1).copy()
     _renormalize_quats_numpy(mean_np, n_rods)
+    # Push renormalized mean back into GTSAM so the next step's state_torch
+    # is built from a state with unit quaternions.
+    try:
+        P_post = np.asarray(state_post.covariance(), dtype=np.float64)
+        state_post = kf.init(mean_np.reshape(state_dim, 1), _make_pd_bounded(P_post))
+    except RuntimeError:
+        pass
+
+    # LSTM sync: re-advance hidden state from the posterior mean so the next
+    # predict step sees the correct GNN temporal context.  Restoring ctx_pre
+    # undoes the prior-based advance that happened during the affine-term
+    # simulator.step() call above.
+    _restore_model_ctx(simulator, ctx_pre)
+    posterior_torch = torch.tensor(
+        mean_np, dtype=dtype, device=device
+    ).reshape(1, state_dim, 1)
+    with torch.no_grad():
+        simulator.step(posterior_torch, ctrls=ctrl,
+                       state_to_graph_kwargs=s2g_kwargs)
+
     return mean_np, state_post
 
 
@@ -317,11 +420,13 @@ class OnlineEKF:
     def __init__(self, simulator, dt, n_rods,
                  process_noise_scale=1e-4, measurement_noise_scale=1e-3,
                  observe_pose_only=False, use_finite_diff=False,
-                 innovation_gate_sigma=np.inf,
-                 Q_quat_inflation=2.0, Q_vel_inflation=2.0,
+                 innovation_gate_sigma=5.0,
+                 Q_quat_inflation=2.0, Q_vel_inflation=0.5,
                  control_jacobian_mode="identity",
                  require_control_jacobian=False,
-                 dataset_idx_val=9):
+                 dataset_idx_val=9,
+                 ema_alpha=0.35,
+                 max_linvel=3.0, max_angvel=25.0):
         self.simulator = simulator
         self.dt = dt
         self.n_rods = n_rods
@@ -334,6 +439,10 @@ class OnlineEKF:
         self.control_jacobian_mode = control_jacobian_mode
         self.require_control_jacobian = require_control_jacobian
         self.dataset_idx_val = dataset_idx_val
+        self.ema_alpha = ema_alpha
+        self._ema_state = None
+        self.max_linvel = max_linvel
+        self.max_angvel = max_angvel
 
         base_Q_sigma = np.sqrt(float(process_noise_scale))
         self.Q_sigmas = _structured_Q_sigmas(
@@ -343,8 +452,8 @@ class OnlineEKF:
         if observe_pose_only:
             meas_dim = 7 * n_rods
             self.H_np = np.zeros((meas_dim, self.state_dim), dtype=np.float64)
-            for i in range(meas_dim):
-                self.H_np[i, i] = 1.0
+            for r in range(n_rods):
+                self.H_np[r * 7 : r * 7 + 7, r * 13 : r * 13 + 7] = np.eye(7, dtype=np.float64)
         else:
             meas_dim = self.state_dim
             self.H_np = np.eye(self.state_dim, dtype=np.float64)
@@ -353,6 +462,7 @@ class OnlineEKF:
         self.kf = gtsam.KalmanFilter(self.state_dim)
         self.state_gtsam = None
         self.state_torch = None
+        self._prev_pose_z = None  # last measurement pose for finite-diff velocity
 
     def initialize(self, start_state: torch.Tensor,
                    rest_lengths=None, motor_speeds=None):
@@ -386,6 +496,8 @@ class OnlineEKF:
         )
         self.state_gtsam = self.kf.init(x0_np, P0_np)
         self.state_torch = start_state.clone()
+        self._ema_state = None
+        self._prev_pose_z = None
 
     def step(self, z_t: np.ndarray = None, u_t=None,
              have_measurement=True) -> torch.Tensor:
@@ -419,10 +531,104 @@ class OnlineEKF:
                 require_control_jacobian=self.require_control_jacobian,
                 dataset_idx_val=self.dataset_idx_val,
             )
+        if have_measurement and z_t is not None:
+            mean_np = self._inject_fd_velocities(mean_np, z_t)
+            self._prev_pose_z = z_t.reshape(-1).copy()
+        mean_np = self._clamp_velocities(mean_np)
         self.state_torch = torch.tensor(
             mean_np, dtype=dtype, device=device
         ).view(1, self.state_dim, 1)
-        return self.state_torch
+        if self._ema_state is None:
+            self._ema_state = self.state_torch.clone()
+        else:
+            self._ema_state = (self.ema_alpha * self.state_torch
+                               + (1.0 - self.ema_alpha) * self._ema_state)
+        return self._ema_state
+
+    def _inject_fd_velocities(self, mean_np: np.ndarray,
+                              z_t: np.ndarray) -> np.ndarray:
+        """Replace velocity state with finite-difference estimates from pose measurements.
+
+        When velocities are not directly observed (pose-only mode), the EKF
+        Kalman gain for velocity rows is zero — they stay frozen at their prior
+        value (often zero from a cold start).  Computing linvel/angvel from
+        consecutive pose measurements and writing them directly into the state
+        breaks the zero-velocity deadlock and gives the GNN meaningful dynamics
+        context for the next predict step.
+
+        Only applied when a previous measurement exists (skipped on first step).
+        """
+        if self._prev_pose_z is None:
+            return mean_np
+
+        mean_np = mean_np.copy()
+        z_curr = z_t.reshape(-1)
+        z_prev = self._prev_pose_z.reshape(-1)
+        dt = self.dt
+
+        pose_per_rod = z_curr.size // self.n_rods  # 7 (pos+quat) or 13
+
+        for r in range(self.n_rods):
+            # Linear velocity from position finite difference
+            pos_curr = z_curr[pose_per_rod * r     : pose_per_rod * r + 3]
+            pos_prev = z_prev[pose_per_rod * r     : pose_per_rod * r + 3]
+            linvel_fd = (pos_curr - pos_prev) / dt
+
+            # Angular velocity from quaternion finite difference.
+            # Uses axis-angle form to match compute_ang_vel_quat in torch_quaternion.py.
+            # Convention: q = [w, x, y, z] (w-first).
+            # q_diff = q_curr * inv(q_prev) = q_curr * conj(q_prev) (unit quats)
+            q_curr = z_curr[pose_per_rod * r + 3 : pose_per_rod * r + 7]
+            q_prev = z_prev[pose_per_rod * r + 3 : pose_per_rod * r + 7]
+            if np.dot(q_curr, q_prev) < 0:
+                q_prev = -q_prev
+            # Conjugate of q_prev: negate xyz part
+            q_prev_conj = np.array([q_prev[0], -q_prev[1], -q_prev[2], -q_prev[3]])
+            # Hamilton product q_curr * q_prev_conj  (w-first)
+            w0, x0, y0, z0 = q_curr
+            w1, x1, y1, z1 = q_prev_conj
+            q_rel = np.array([
+                w0*w1 - x0*x1 - y0*y1 - z0*z1,
+                w0*x1 + x0*w1 + y0*z1 - z0*y1,
+                w0*y1 - x0*z1 + y0*w1 + z0*x1,
+                w0*z1 + x0*y1 - y0*x1 + z0*w1,
+            ])
+            vec_norm = np.linalg.norm(q_rel[1:])
+            angle = 2.0 * np.arctan2(vec_norm, q_rel[0])
+            # Short-path: prefer the angle with smaller absolute value
+            if abs(angle - 2.0 * np.pi) < abs(angle):
+                angle -= 2.0 * np.pi
+            if vec_norm > 1e-10:
+                axis = q_rel[1:] / np.sin(angle / 2.0)
+            else:
+                axis = np.zeros(3)
+            angvel_fd = angle * axis / dt
+
+            base = 13 * r
+            mean_np[base + 7  : base + 10] = linvel_fd
+            mean_np[base + 10 : base + 13] = angvel_fd
+
+        return mean_np
+
+    def _clamp_velocities(self, mean_np: np.ndarray) -> np.ndarray:
+        """Clamp linear and angular velocities to physically plausible ranges.
+
+        State layout per rod (13 dims): pos[3] quat[4] linvel[3] angvel[3].
+        Without clamping, a cold LSTM first step can produce hundreds of rad/s,
+        which corrupts every subsequent predict step.
+        """
+        mean_np = mean_np.copy()
+        for r in range(self.n_rods):
+            base = 13 * r
+            linvel = mean_np[base + 7 : base + 10]
+            angvel = mean_np[base + 10 : base + 13]
+            lv_norm = np.linalg.norm(linvel)
+            av_norm = np.linalg.norm(angvel)
+            if lv_norm > self.max_linvel:
+                mean_np[base + 7 : base + 10] = linvel * (self.max_linvel / lv_norm)
+            if av_norm > self.max_angvel:
+                mean_np[base + 10 : base + 13] = angvel * (self.max_angvel / av_norm)
+        return mean_np
 
 
 # ---------------------------------------------------------------------------
@@ -533,8 +739,8 @@ def run_ekf_rollout(simulator,
 
     if observe_pose_only:
         H_np = np.zeros((meas_dim, state_dim), dtype=np.float64)
-        for i in range(meas_dim):
-            H_np[i, i] = 1.0
+        for r in range(n_rods):
+            H_np[r * 7 : r * 7 + 7, r * 13 : r * 13 + 7] = np.eye(7, dtype=np.float64)
     else:
         H_np = np.eye(state_dim, dtype=np.float64)
 
