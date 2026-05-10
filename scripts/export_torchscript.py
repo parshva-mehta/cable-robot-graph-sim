@@ -35,6 +35,17 @@ from simulators.tensegrity_gnn_simulator import (  # noqa: E402
 )
 
 
+def _last_linear_out_features(module: torch.nn.Module) -> int:
+    """Return out_features of the final Linear layer in `module`."""
+    out_features = None
+    for submodule in module.modules():
+        if isinstance(submodule, torch.nn.Linear):
+            out_features = submodule.out_features
+    if out_features is None:
+        raise ValueError("could not infer out_features: no Linear layer found")
+    return out_features
+
+
 def build_scriptable_from_sim(sim: TensegrityGNNSimulator) -> ScriptableEncodeProcessDecode:
     """Construct a ScriptableEncodeProcessDecode with shapes matching `sim`'s
     EncodeProcessDecode and copy weights into it.
@@ -55,7 +66,7 @@ def build_scriptable_from_sim(sim: TensegrityGNNSimulator) -> ScriptableEncodePr
     processor_cfg = inner._processor
     decoder_cfg = inner._decoder
 
-    n_out = decoder_cfg.node_decode_fn[-1].out_features
+    n_out = _last_linear_out_features(decoder_cfg.node_decode_fn)
     latent_dim = encoder_cfg.n_out
 
     nmessage_passing_steps = (
