@@ -11,7 +11,10 @@
       "Bash(conda info *)",
       "Bash(python *)",
       "Bash(/opt/homebrew/Caskroom/miniconda/base/envs/cable_robot_gnn/bin/python *)",
-      "Bash(/opt/homebrew/Caskroom/miniconda/base/envs/cable_robot_gnn/bin/pip show *)"
+      "Bash(/opt/homebrew/Caskroom/miniconda/base/envs/cable_robot_gnn/bin/pip show *)",
+      "Bash(conda env *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

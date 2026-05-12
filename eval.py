@@ -209,13 +209,13 @@ def batch_compute_end_pts(sim, batch_state: torch.Tensor):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str,
-#                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
-                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
+                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+                        #default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
 
                         help='Path to trained .pt model file')
     parser.add_argument('--data_dir', type=str,
-                        #default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
-                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        #default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
                         help='Directory with processed_data.json and extra_state_data.json')
     parser.add_argument('--output', type=str, default=None,
                         help='Output rollout text file (default derived from --mode)')
@@ -232,6 +232,8 @@ def main():
                         help='Observe only pose (pos+quat); skip velocities')
     parser.add_argument('--innovation_gate', type=float, default=3.0,
                         help='Reject updates with ||innovation|| > gate*sqrt(meas_dim)')
+    parser.add_argument('--jac_update_period', type=int, default=5,
+                        help='Recompute EKF Jacobian every N steps (1=every step, 5=5x speedup)')
     parser.add_argument('--dataset_idx', type=int, default=9)
     args = parser.parse_args()
 
@@ -335,6 +337,7 @@ def main():
             use_finite_diff=True,
             innovation_gate_sigma=args.innovation_gate,
             dataset_idx_val=args.dataset_idx,
+            jac_update_period=args.jac_update_period,
         )
         write_frames_to_file(frames, args.output, mode='ekf')
         com_err, rot_err, pen_err = evaluate_from_frames(

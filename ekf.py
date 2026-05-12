@@ -215,7 +215,8 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
                     use_finite_diff, innovation_gate_sigma=np.inf,
                     control_jacobian_mode="identity",
                     require_control_jacobian=False,
-                    dataset_idx_val=9):
+                    dataset_idx_val=9,
+                    cached_F=None):
     """One EKF predict-and-update step using GTSAM.
 
     Linearization (Jacobian F and nominal next state) comes from linearize_dynamics.
@@ -240,10 +241,15 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
         control_jacobian_mode: "identity" or "simulator".
         require_control_jacobian: Raise if simulator Jacobian unavailable.
         dataset_idx_val: Integer dataset index forwarded to the graph processor.
+        cached_F: Pre-computed Jacobian (state_dim, state_dim) float64 ndarray.
+            When provided, linearize_dynamics is skipped entirely, saving 79
+            GNN forward passes. Pass None to recompute as usual.
 
     Returns:
         mean_for_output: State mean (quats renormalized).
         state_gtsam: New GTSAM state.
+        F_np: The Jacobian used this step (recomputed or cached), so callers
+            can store it for future steps.
     """
     state_dim = state_torch.numel()
     x_mean = np.array(state_gtsam.mean()).reshape(-1).astype(np.float64)
@@ -254,17 +260,19 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     # with the filtered state.
     ctx_pre = _save_model_ctx(simulator)
 
-    # --- Jacobian F from linearize_dynamics (uses zero controls internally) ---
-    _, F_np = linearize_dynamics(
-        simulator, state_torch,
-        sample_index=dataset_idx_val,
-        use_finite_diff=use_finite_diff,
-    )
-
-    if not np.all(np.isfinite(F_np)):
-        F_np = np.eye(state_dim, dtype=np.float64)
+    # --- Jacobian F: recompute or reuse cached value ----------------------
+    if cached_F is not None:
+        F_np = cached_F
     else:
-        F_np = _fix_jacobian_quaternion_rank(F_np, x_mean, n_rods)
+        _, F_np = linearize_dynamics(
+            simulator, state_torch,
+            sample_index=dataset_idx_val,
+            use_finite_diff=use_finite_diff,
+        )
+        if not np.all(np.isfinite(F_np)):
+            F_np = np.eye(state_dim, dtype=np.float64)
+        else:
+            F_np = _fix_jacobian_quaternion_rank(F_np, x_mean, n_rods)
 
     # --- Nominal next state with actual controls ----------------------------
     device = state_torch.device
@@ -343,7 +351,7 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
 
     if not have_measurement:
         mean_np = np.array(state_pred.mean()).reshape(-1)
-        return mean_np, state_pred
+        return mean_np, state_pred, F_np
 
     mean_pred = np.array(state_pred.mean()).reshape(-1).copy()
     try:
@@ -375,7 +383,7 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
             np.linalg.norm(innovation) > innovation_gate_sigma * np.sqrt(innovation.size)):
         mean_for_output = mean_pred.copy()
         _renormalize_quats_numpy(mean_for_output, n_rods)
-        return mean_for_output, state_pred
+        return mean_for_output, state_pred, F_np
 
     meas_dim = meas_size
     z_col = z_adj.reshape(meas_dim, 1)
@@ -407,7 +415,7 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
         simulator.step(posterior_torch, ctrls=ctrl,
                        state_to_graph_kwargs=s2g_kwargs)
 
-    return mean_np, state_post
+    return mean_np, state_post, F_np
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +528,7 @@ class OnlineEKF:
 
         ctrl_step = _ensure_ctrl_for_step(u_t, self.simulator)
         with torch.no_grad():
-            mean_np, self.state_gtsam = _ekf_step_gtsam(
+            mean_np, self.state_gtsam, _ = _ekf_step_gtsam(
                 self.kf, self.state_gtsam, self.simulator,
                 self.state_torch, self.dt, ctrl_step, self.H_np, z_t,
                 self.Q_sigmas, self.R_sigmas, self.n_rods,
@@ -648,7 +656,8 @@ def run_ekf_rollout(simulator,
                     Q_vel_inflation=2.0,
                     innovation_gate_sigma=np.inf,
                     control_jacobian_mode="simulator",
-                    dataset_idx_val=9):
+                    dataset_idx_val=9,
+                    jac_update_period=1):
     """Run an EKF rollout over ground-truth data with predict/update steps.
 
     Initializes from start_state or from gt_data[0] (pos, quat, linvel, angvel).
@@ -674,6 +683,10 @@ def run_ekf_rollout(simulator,
         control_jacobian_mode: "identity" or "simulator".
         dataset_idx_val: Integer dataset index for the graph processor
             (matches the value used in eval.py; default 9).
+        jac_update_period: Recompute the Jacobian every this many steps
+            (default 1 = every step).  Larger values trade filter accuracy for
+            speed: period=5 gives ~5× fewer linearize_dynamics calls (each of
+            which costs 79 GNN forward passes with use_finite_diff=True).
 
     Returns:
         frames: List of dicts with keys 'time', 'pose', 'state'.
@@ -751,6 +764,8 @@ def run_ekf_rollout(simulator,
     frames.append({"time": time, "pose": pose,
                    "state": state_for_frame.detach().clone()})
 
+    cached_F = None  # Jacobian cache for jac_update_period > 1
+
     with torch.no_grad():
         for k, extra in enumerate(tqdm.tqdm(extra_gt_data)):
             have_measurement = k + 1 < len(gt_data)
@@ -772,13 +787,17 @@ def run_ekf_rollout(simulator,
                     av = np.array(gt['angvel'], dtype=np.float64).reshape(-1, 3)
                     z_np = np.hstack([pos, quat, lv, av]).reshape(-1)
 
-            mean_np, state_gtsam = _ekf_step_gtsam(
+            # Pass cached_F when not a recompute step; _ekf_step_gtsam returns
+            # the Jacobian it used so we can store it for future steps.
+            recompute_jac = (k % jac_update_period == 0)
+            mean_np, state_gtsam, cached_F = _ekf_step_gtsam(
                 kf, state_gtsam, simulator, state_torch, dt, ctrl_step,
                 H_np, z_np, Q_sigmas, R_sigmas, n_rods, have_measurement,
                 use_finite_diff=use_finite_diff,
                 innovation_gate_sigma=innovation_gate_sigma,
                 control_jacobian_mode=control_jacobian_mode,
                 dataset_idx_val=dataset_idx_val,
+                cached_F=None if recompute_jac else cached_F,
             )
 
             state_for_frame = torch.from_numpy(mean_np).to(
