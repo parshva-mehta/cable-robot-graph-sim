@@ -15,7 +15,10 @@
       "Bash(pip install *)",
       "Bash(pip search *)",
       "Bash(conda search *)",
-      "Bash(C:\\\\Users\\\\parshva-mehta\\\\miniconda3\\\\envs\\\\cable_robot_gnn\\\\python.exe test_gtsam.py)"
+      "Bash(C:\\\\Users\\\\parshva-mehta\\\\miniconda3\\\\envs\\\\cable_robot_gnn\\\\python.exe test_gtsam.py)",
+      "Bash(conda env *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

@@ -1,4 +1,5 @@
 import math
+import sys
 from pathlib import Path
 from typing import List, Dict, Union
 
@@ -289,7 +290,7 @@ class TensegrityGNNSimulator(LearnedSimulator):
 
         iterator = range(num_multi_steps)
         if show_progress:
-            iterator = tqdm.tqdm(iterator)
+            iterator = tqdm.tqdm(iterator, dynamic_ncols=True, file=sys.stderr)
 
         states, graphs, rest_lens = [], [], []
         for i in iterator:
