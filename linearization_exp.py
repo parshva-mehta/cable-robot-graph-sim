@@ -115,6 +115,39 @@ def step_exp(model,
 # Jacobian in exp-map space
 # ---------------------------------------------------------------------------
 
+def compute_nominal_step_exp(
+    model,
+    state_exp,
+    sample_index: int = 0,
+    ctrls=None,
+) -> np.ndarray:
+    """Run one GNN forward pass in exp-map space, returning only the next state.
+
+    Cheaper than linearize_dynamics_exp — no Jacobian is computed.
+    Used on EKF steps where F is served from the cache.
+    """
+    if isinstance(state_exp, torch.Tensor):
+        state_exp_np = state_exp.detach().cpu().numpy().flatten().astype(np.float64)
+    else:
+        state_exp_np = np.asarray(state_exp, dtype=np.float64).flatten()
+
+    try:
+        ref = next(model.parameters())
+        dtype, dev = ref.dtype, ref.device
+    except StopIteration:
+        dtype, dev = torch.float32, torch.device('cpu')
+
+    dataset_idx   = torch.tensor([[sample_index]], dtype=torch.long, device=dev)
+    s2g_kwargs    = {'dataset_idx': dataset_idx}
+    ctrls_t       = _build_zero_ctrls(model, dtype, dev)
+    nominal_ctrls = ctrls if ctrls is not None else ctrls_t
+
+    x_t = torch.tensor(state_exp_np, dtype=dtype, device=dev).reshape(1, EXP_STATE_DIM, 1)
+    with torch.no_grad():
+        ns = step_exp(model, x_t, nominal_ctrls, s2g_kwargs)
+    return ns[0, :EXP_STATE_DIM, 0].detach().cpu().numpy().astype(np.float64)
+
+
 def linearize_dynamics_exp(
     model,
     state_exp,
@@ -156,7 +189,7 @@ def linearize_dynamics_exp(
         def step_fn(x_flat: torch.Tensor) -> torch.Tensor:
             _restore_model_ctx(model, ctx)
             x = x_flat.reshape(1, EXP_STATE_DIM, 1)
-            ns = step_exp(model, x, ctrls_t, s2g_kwargs)
+            ns = step_exp(model, x, nominal_ctrls, s2g_kwargs)
             return ns[0, :EXP_STATE_DIM, 0]
 
         state_in = torch.tensor(state_exp_np, dtype=dtype, device=dev)
