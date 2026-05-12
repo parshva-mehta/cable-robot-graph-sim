@@ -29,6 +29,7 @@ from linearization_exp import (
     quat_state_to_exp_state,
     exp_state_to_quat_state,
     linearize_dynamics_exp,
+    compute_nominal_step_exp,
 )
 from utilities.misc_utils import DEFAULT_DTYPE
 
@@ -179,7 +180,8 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
                     use_finite_diff, innovation_gate_sigma=np.inf,
                     control_jacobian_mode="identity",
                     require_control_jacobian=False,
-                    dataset_idx_val=9):
+                    dataset_idx_val=9,
+                    cached_F=None):
     """One EKF predict-and-update step using GTSAM (exp-map state space).
 
     Differences from ekf.py:
@@ -234,13 +236,24 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
     # can re-advance the LSTM from the posterior after the update.
     ctx_pre = _save_model_ctx(simulator)
 
-    # --- 36×36 Jacobian + nominal next state (actual controls) ---------------
-    next_state_0_np, F_np = linearize_dynamics_exp(
-        simulator, state_exp_t,
-        sample_index=dataset_idx_val,
-        use_finite_diff=use_finite_diff,
-        ctrls=ctrl,
-    )
+    # --- Nominal next state + Jacobian ---------------------------------------
+    # When a cached F is provided, skip the expensive Jacobian computation and
+    # run only a single cheap GNN forward pass for the predict mean.
+    if cached_F is not None:
+        next_state_0_np = compute_nominal_step_exp(
+            simulator, state_exp_t,
+            sample_index=dataset_idx_val,
+            ctrls=ctrl,
+        )
+        F_np = cached_F
+        _restore_model_ctx(simulator, ctx_pre)
+    else:
+        next_state_0_np, F_np = linearize_dynamics_exp(
+            simulator, state_exp_t,
+            sample_index=dataset_idx_val,
+            use_finite_diff=use_finite_diff,
+            ctrls=ctrl,
+        )
 
     if not np.all(np.isfinite(F_np)):
         F_np = np.eye(state_dim, dtype=np.float64)
@@ -388,7 +401,8 @@ class OnlineEKF:
                  exp_inflation=1.5, vel_inflation=0.5,
                  dataset_idx_val=9,
                  ema_alpha=0.35,
-                 max_linvel=3.0, max_angvel=25.0):
+                 max_linvel=3.0, max_angvel=25.0,
+                 jacobian_update_interval=10):
         self.simulator             = simulator
         self.dt                    = dt
         self.n_rods                = n_rods
@@ -432,6 +446,10 @@ class OnlineEKF:
         self.max_angvel   = max_angvel
         self._ema_state   = None
         self._prev_z_quat = None  # last raw quat measurement for FD velocity
+
+        self.jacobian_update_interval = jacobian_update_interval
+        self._step_count  = 0
+        self._cached_F    = None   # reused between Jacobian recomputations
 
         self.kf           = gtsam.KalmanFilter(self.state_dim)
         self.state_gtsam  = None
@@ -493,6 +511,21 @@ class OnlineEKF:
         if have_measurement:
             z_exp = self._convert_measurement(z_t)
 
+        # Recompute Jacobian every jacobian_update_interval steps.
+        # linearize_dynamics_exp restores simulator context internally, so it is
+        # safe to call before _ekf_step_gtsam.
+        if (self._cached_F is None
+                or self._step_count % self.jacobian_update_interval == 0):
+            _, self._cached_F = linearize_dynamics_exp(
+                self.simulator, self.state_exp_t,
+                sample_index=self.dataset_idx_val,
+                use_finite_diff=self.use_finite_diff,
+                ctrls=ctrl_step,
+            )
+
+        # Always pass the cached F — _ekf_step_gtsam uses compute_nominal_step_exp
+        # (one cheap GNN forward pass) for the predict mean instead of re-running
+        # the full linearization.
         with torch.no_grad():
             mean_np, self.state_gtsam, self.kf = _ekf_step_gtsam(
                 self.kf, self.state_gtsam, self.simulator,
@@ -503,7 +536,10 @@ class OnlineEKF:
                 use_finite_diff=self.use_finite_diff,
                 innovation_gate_sigma=self.innovation_gate_sigma,
                 dataset_idx_val=self.dataset_idx_val,
+                cached_F=self._cached_F,
             )
+
+        self._step_count += 1
 
         if have_measurement and z_t is not None:
             mean_np = self._inject_fd_velocities(mean_np, z_t)
@@ -615,7 +651,8 @@ def run_ekf_rollout(simulator,
                     exp_inflation=1.5,
                     vel_inflation=0.5,
                     innovation_gate_sigma=5.0,
-                    dataset_idx_val=9):
+                    dataset_idx_val=9,
+                    jacobian_update_interval=10):
     """Run an EKF rollout over ground-truth data (exp-map state space).
 
     API matches ekf.run_ekf_rollout; 'pose' in returned frames is still
@@ -714,6 +751,7 @@ def run_ekf_rollout(simulator,
 
     frames = []
     time   = 0.0
+    cached_F = None
 
     # First frame — convert exp back to quat for pose output
     pose = _exp_state_to_pose_np(start_exp, n_rods, dtype, device)
@@ -732,6 +770,16 @@ def run_ekf_rollout(simulator,
             ).to(device=device, dtype=dtype).reshape(1, state_dim, 1)
 
             ctrl_step = _ensure_ctrl_for_step(extra['controls'], simulator)
+
+            # Recompute Jacobian every jacobian_update_interval steps.
+            # linearize_dynamics_exp restores simulator context internally.
+            if cached_F is None or k % jacobian_update_interval == 0:
+                _, cached_F = linearize_dynamics_exp(
+                    simulator, state_exp_t,
+                    sample_index=dataset_idx_val,
+                    use_finite_diff=use_finite_diff,
+                    ctrls=ctrl_step,
+                )
 
             # Build measurement in exp-map space
             z_exp = None
@@ -764,6 +812,7 @@ def run_ekf_rollout(simulator,
                 use_finite_diff=use_finite_diff,
                 innovation_gate_sigma=innovation_gate_sigma,
                 dataset_idx_val=dataset_idx_val,
+                cached_F=cached_F,
             )
 
             state_for_frame = torch.from_numpy(mean_np).to(

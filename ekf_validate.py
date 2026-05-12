@@ -403,12 +403,10 @@ def validate_ekf(model_path, data_path, extra_data_path,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str,
-                        #default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
-                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
+                        default="C:/Users/parshva-mehta/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
                         help='Path to trained .pt model file')
     parser.add_argument('--data_dir', type=str,
-                        #default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
-                        default="C:/Users/parshva-mehta/OneDrive/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        default="C:/Users/parshva-mehta/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
                         help='Directory with processed_data.json and extra_state_data.json')
     parser.add_argument('--process-noise', type=float, default=1e-4)
     parser.add_argument('--measurement-noise', type=float, default=1e-3)

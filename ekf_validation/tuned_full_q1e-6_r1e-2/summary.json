@@ -1,0 +1,31 @@
+{
+  "residuals": {
+    "n_timesteps": 1499,
+    "n_measurements": 21,
+    "innovation_mean": 0.17163688973704547,
+    "innovation_std": 0.28688177750822563,
+    "normality_test_p": 6.582073864036648e-42,
+    "normality_pass": false,
+    "autocorr_lag1": 0.9964040285447852,
+    "autocorr_pass": false
+  },
+  "covariance": {
+    "n_timesteps": 1499,
+    "state_dim": 39,
+    "all_positive_definite": true,
+    "eigenvalue_issues": [],
+    "log_det_mean": -390.7521764294139,
+    "log_det_std": 21.560220074571454
+  },
+  "performance": {
+    "gnn_full_state_mse": 1.3763079718088287,
+    "filtered_full_state_mse": 1.3489662313052047,
+    "improvement_full": 0.019866004601937482,
+    "gnn_position_mse": 3.3874796006442174,
+    "filtered_position_mse": 3.740272109396133,
+    "improvement_position": -0.10414601719650457,
+    "gnn_rotation_mse": 0.8039926448140386,
+    "filtered_rotation_mse": 0.5882627022411265,
+    "improvement_rotation": 0.26832327874837403
+  }
+}
