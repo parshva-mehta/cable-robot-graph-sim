@@ -1,3 +1,5 @@
 .idea/
 *.mp4
 *.pyc
+*.md
+!README.md
