@@ -167,7 +167,10 @@ def _clamp_spectral_radius(
         return J, sr_raw, sr_raw
 
     mags = np.abs(eigenvalues)
-    scale = np.where(mags > max_spectral_radius, max_spectral_radius / mags, 1.0)
+    # Guard against zero-magnitude eigenvalues: np.where evaluates both branches
+    # before masking, so division by zero occurs even when the mask is False.
+    safe_mags = np.where(mags > 0, mags, np.finfo(np.float64).tiny)
+    scale = np.where(mags > max_spectral_radius, max_spectral_radius / safe_mags, 1.0)
     eigenvalues_clamped = eigenvalues * scale
 
     try:
@@ -264,7 +267,7 @@ def linearize_dynamics_exp(
     _restore_model_ctx(model, ctx)
 
     J_np, sr_raw, sr_fixed = _clamp_spectral_radius(J_np, max_spectral_radius)
-    if sr_raw > max_spectral_radius:
+    if sr_raw > max_spectral_radius * 1.01:
         print(f"  [exp SR clamp] raw SR={sr_raw:.4f} → clamped to {sr_fixed:.4f}")
 
     return next_state_np, J_np
