@@ -148,12 +148,49 @@ def compute_nominal_step_exp(
     return ns[0, :EXP_STATE_DIM, 0].detach().cpu().numpy().astype(np.float64)
 
 
+def _clamp_spectral_radius(
+    J: np.ndarray,
+    max_spectral_radius: float = 1.0,
+) -> tuple[np.ndarray, float, float]:
+    """Clamp individual eigenvalues of J that exceed max_spectral_radius.
+
+    Unlike global scaling (J * r/sr), only stiff directions are shrunk;
+    well-conditioned directions are left untouched.  Falls back to global
+    scaling when the eigenvector matrix V is ill-conditioned (cond > 1e10),
+    which can occur when a few cable/contact directions dominate the spectrum.
+
+    Returns (J_clamped, sr_raw, sr_fixed).
+    """
+    eigenvalues, V = np.linalg.eig(J)
+    sr_raw = float(np.max(np.abs(eigenvalues)))
+    if sr_raw <= max_spectral_radius:
+        return J, sr_raw, sr_raw
+
+    mags = np.abs(eigenvalues)
+    scale = np.where(mags > max_spectral_radius, max_spectral_radius / mags, 1.0)
+    eigenvalues_clamped = eigenvalues * scale
+
+    try:
+        cond_V = np.linalg.cond(V)
+        if not np.isfinite(cond_V) or cond_V > 1e10:
+            raise np.linalg.LinAlgError(f"V ill-conditioned (cond={cond_V:.2e})")
+        V_inv = np.linalg.inv(V)
+        J_clamped = np.real(V @ np.diag(eigenvalues_clamped) @ V_inv)
+    except np.linalg.LinAlgError:
+        # Eigenvector matrix is degenerate; fall back to global scaling.
+        J_clamped = J * (max_spectral_radius / sr_raw)
+
+    sr_fixed = float(np.max(np.abs(np.linalg.eigvals(J_clamped))))
+    return J_clamped, sr_raw, sr_fixed
+
+
 def linearize_dynamics_exp(
     model,
     state_exp,
     sample_index: int = 0,
     use_finite_diff: bool = False,
     ctrls=None,
+    max_spectral_radius: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Linearize the exp-map-wrapped one-step dynamics at *state_exp*.
 
@@ -225,5 +262,9 @@ def linearize_dynamics_exp(
     # call simulator.step() with actual controls without seeing corrupted
     # state left over from the last forward pass above.
     _restore_model_ctx(model, ctx)
+
+    J_np, sr_raw, sr_fixed = _clamp_spectral_radius(J_np, max_spectral_radius)
+    if sr_raw > max_spectral_radius:
+        print(f"  [exp SR clamp] raw SR={sr_raw:.4f} → clamped to {sr_fixed:.4f}")
 
     return next_state_np, J_np
