@@ -194,6 +194,7 @@ def linearize_dynamics_exp(
     use_finite_diff: bool = False,
     ctrls=None,
     max_spectral_radius: float = 1.0,
+    verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Linearize the exp-map-wrapped one-step dynamics at *state_exp*.
 
@@ -267,7 +268,7 @@ def linearize_dynamics_exp(
     _restore_model_ctx(model, ctx)
 
     J_np, sr_raw, sr_fixed = _clamp_spectral_radius(J_np, max_spectral_radius)
-    if sr_raw > max_spectral_radius * 1.01:
+    if verbose and sr_raw > max_spectral_radius * 1.01:
         print(f"  [exp SR clamp] raw SR={sr_raw:.4f} → clamped to {sr_fixed:.4f}")
 
     return next_state_np, J_np
