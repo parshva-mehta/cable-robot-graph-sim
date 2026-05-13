@@ -232,6 +232,12 @@ def main():
     parser.add_argument('--jac_update_period', type=int, default=5,
                         help='Recompute EKF Jacobian every N steps (1=every step, 5=5x speedup)')
     parser.add_argument('--dataset_idx', type=int, default=9)
+    parser.add_argument('--compare_raw', action='store_true', default=False,
+                        help='Also run raw GNN rollout alongside EKF and print comparison '
+                             '(ekf/ekf_exp modes only; ratio≈1.0 means EKF not correcting)')
+    parser.add_argument('--log_kalman_diagnostics', action='store_true', default=False,
+                        help='Print per-step Kalman gain proxy for position block '
+                             '(ekf_exp mode only; shows innovation vs correction norms)')
     args = parser.parse_args()
 
     # Derive output filename from mode when not explicitly provided
@@ -354,6 +360,7 @@ def main():
             use_finite_diff=False,
             innovation_gate_sigma=args.innovation_gate,
             dataset_idx_val=args.dataset_idx,
+            log_diagnostics=args.log_kalman_diagnostics,
         )
         write_frames_to_file(frames, args.output, mode='ekf_exp')
         com_err, rot_err, pen_err = evaluate_from_frames(
@@ -363,6 +370,21 @@ def main():
     print(f'COM Error (MSE):       {com_err:.6f} m\u00b2')
     print(f'Rotation Error (mean): {rot_err:.6f} rad')
     print(f'Penetration Error:     {pen_err:.6f} m')
+
+    if args.compare_raw and args.mode in ('ekf', 'ekf_exp'):
+        # evaluate() reinitializes cables/motor/LSTM before running, so it is
+        # safe to call after the EKF has consumed the simulator.
+        raw_com_err, raw_rot_err, raw_pen_err = evaluate(
+            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
+        )
+        print(f'\n=== Raw GNN baseline (for comparison) ===')
+        print(f'COM Error (MSE):       {raw_com_err:.6f} m\u00b2')
+        print(f'Rotation Error (mean): {raw_rot_err:.6f} rad')
+        print(f'Penetration Error:     {raw_pen_err:.6f} m')
+        if raw_com_err > 1e-12:
+            ratio = com_err / raw_com_err
+            print(f'EKF/raw COM ratio: {ratio:.3f}  '
+                  f'(< 1.0 = EKF improves, \u2248 1.0 = EKF not correcting position)')
 
 
 if __name__ == '__main__':

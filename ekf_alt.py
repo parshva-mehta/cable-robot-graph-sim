@@ -181,7 +181,8 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
                     control_jacobian_mode="identity",
                     require_control_jacobian=False,
                     dataset_idx_val=9,
-                    cached_F=None):
+                    cached_F=None,
+                    diagnostics=None):
     """One EKF predict-and-update step using GTSAM (exp-map state space).
 
     Differences from ekf.py:
@@ -340,6 +341,16 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
     mean_pred = _sanitize_mean(mean_pred_raw, x_mean)
 
     innovation = z_np.reshape(-1) - (H_np @ mean_pred)
+
+    # Diagnostic: per-rod position innovation norm (measurement vs predicted pos).
+    if diagnostics is not None:
+        obs_dim = z_np.size
+        pos_stride = 6 if obs_dim == 6 * n_rods else EXP_BLOCK_SIZE
+        diagnostics['pos_innovation_norm'] = float(np.mean([
+            np.linalg.norm(innovation[pos_stride * r : pos_stride * r + 3])
+            for r in range(n_rods)
+        ]))
+
     if (np.isfinite(innovation_gate_sigma) and
             np.linalg.norm(innovation) > innovation_gate_sigma * np.sqrt(innovation.size)):
         # Gate fired: advance LSTM from predicted mean (rejecting the measurement).
@@ -349,6 +360,9 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
         )
         with torch.no_grad():
             simulator.step(gated_quat, ctrls=ctrl, state_to_graph_kwargs=s2g_kwargs)
+        if diagnostics is not None:
+            diagnostics['pos_correction_norm'] = 0.0
+            diagnostics['gated'] = True
         return mean_pred.copy(), state_pred, kf
 
     meas_dim      = z_np.size
@@ -366,6 +380,17 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_exp_t, dt, ctrl,
     except RuntimeError:
         mean_np    = mean_pred.copy()
         state_post = state_pred
+
+    # Diagnostic: per-rod position correction norm (posterior vs predicted pos).
+    if diagnostics is not None:
+        diagnostics['pos_correction_norm'] = float(np.mean([
+            np.linalg.norm(
+                mean_np[EXP_BLOCK_SIZE * r : EXP_BLOCK_SIZE * r + 3]
+                - mean_pred[EXP_BLOCK_SIZE * r : EXP_BLOCK_SIZE * r + 3]
+            )
+            for r in range(n_rods)
+        ]))
+        diagnostics['gated'] = False
 
     # LSTM sync: advance hidden state from the posterior so the next predict
     # step uses correct GNN temporal context.  linearize_dynamics_exp already
@@ -652,7 +677,8 @@ def run_ekf_rollout(simulator,
                     vel_inflation=0.5,
                     innovation_gate_sigma=5.0,
                     dataset_idx_val=9,
-                    jacobian_update_interval=10):
+                    jacobian_update_interval=10,
+                    log_diagnostics=False):
     """Run an EKF rollout over ground-truth data (exp-map state space).
 
     API matches ekf.run_ekf_rollout; 'pose' in returned frames is still
@@ -752,6 +778,8 @@ def run_ekf_rollout(simulator,
     frames = []
     time   = 0.0
     cached_F = None
+    _diag_innov: list[float] = []
+    _diag_corr:  list[float] = []
 
     # First frame — convert exp back to quat for pose output
     pose = _exp_state_to_pose_np(start_exp, n_rods, dtype, device)
@@ -806,6 +834,7 @@ def run_ekf_rollout(simulator,
                         z_quat_full, n_rods, dtype, device
                     )
 
+            step_diag = {} if log_diagnostics else None
             mean_np, state_gtsam, kf = _ekf_step_gtsam(
                 kf, state_gtsam, simulator, state_exp_t, dt, ctrl_step,
                 H_np, z_exp, Q_sigmas, R_sigmas, n_rods, have_measurement,
@@ -813,7 +842,11 @@ def run_ekf_rollout(simulator,
                 innovation_gate_sigma=innovation_gate_sigma,
                 dataset_idx_val=dataset_idx_val,
                 cached_F=cached_F,
+                diagnostics=step_diag,
             )
+            if log_diagnostics and step_diag and 'pos_innovation_norm' in step_diag:
+                _diag_innov.append(step_diag['pos_innovation_norm'])
+                _diag_corr.append(step_diag.get('pos_correction_norm', 0.0))
 
             state_for_frame = torch.from_numpy(mean_np).to(
                 device=device, dtype=dtype
@@ -823,6 +856,16 @@ def run_ekf_rollout(simulator,
             pose = _exp_state_to_pose_np(state_for_frame, n_rods, dtype, device)
             frames.append({"time": time, "pose": pose,
                            "state": state_for_frame.detach().clone()})
+
+    if log_diagnostics and _diag_innov:
+        mean_innov = float(np.mean(_diag_innov))
+        mean_corr  = float(np.mean(_diag_corr))
+        ratio      = mean_corr / max(mean_innov, 1e-10)
+        print(f"\n[EKF position diagnostics — {len(_diag_innov)} steps with measurements]")
+        print(f"  Mean pos innovation  ||z_pos - H·x_pred||: {mean_innov:.4f} m")
+        print(f"  Mean pos correction  ||x_post - x_pred||[pos]: {mean_corr:.4f} m")
+        print(f"  Correction/innovation ratio: {ratio:.4f}")
+        print(f"  (ratio≈0 → Kalman gain near zero for position; ratio≈1 → strong correction)")
 
     return frames
 
