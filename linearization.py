@@ -348,3 +348,95 @@ def linearize_dynamics(
     _restore_model_ctx(model, ctx)
 
     return next_state_np, J_np
+
+
+def linearize_dynamics_with_ctrl(
+    model,
+    state,
+    ctrls_t,
+    sample_index: int = 0,
+    use_finite_diff: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Linearize the one-step dynamics map at (state, ctrls_t).
+
+    Unlike linearize_dynamics(), evaluates the Jacobian at the ACTUAL control
+    ctrls_t rather than zero controls.  This is the correct Jacobian for EKF
+    covariance propagation: P' = F P F^T + Q uses F = df/dx at (x_k, u_k).
+
+    If ctrls_t is None, falls back to zero controls (same as linearize_dynamics).
+
+    Returns
+    -------
+    next_state : (state_dim,) float64 ndarray
+    J          : (state_dim, state_dim) float64 ndarray — df/dx at (x, u)
+    """
+    if isinstance(state, torch.Tensor):
+        state_np = state.detach().cpu().numpy().flatten().astype(np.float64)
+    else:
+        state_np = np.asarray(state, dtype=np.float64).flatten()
+
+    state_dim = len(state_np)
+
+    try:
+        ref = next(model.parameters())
+        dtype, dev = ref.dtype, ref.device
+    except StopIteration:
+        dtype, dev = torch.float32, torch.device('cpu')
+
+    ctx = _save_model_ctx(model)
+
+    if ctrls_t is None:
+        ctrls_t = _build_zero_ctrls(model, dtype, dev)
+    else:
+        ctrls_t = ctrls_t.to(device=dev, dtype=dtype)
+
+    dataset_idx = torch.tensor([[sample_index]], dtype=torch.long, device=dev)
+    s2g_kwargs = {'dataset_idx': dataset_idx}
+
+    def _fwd_np(x_np: np.ndarray) -> np.ndarray:
+        _restore_model_ctx(model, ctx)
+        x_t = torch.tensor(x_np, dtype=dtype, device=dev).reshape(1, state_dim, 1)
+        with torch.no_grad():
+            ns, _ = model.step(x_t, ctrls=ctrls_t, state_to_graph_kwargs=s2g_kwargs)
+        return ns[0, :state_dim, 0].detach().cpu().numpy().astype(np.float64)
+
+    if not use_finite_diff:
+        def step_fn(x_flat: torch.Tensor) -> torch.Tensor:
+            _restore_model_ctx(model, ctx)
+            x = x_flat.reshape(1, state_dim, 1)
+            ns, _ = model.step(x, ctrls=ctrls_t, state_to_graph_kwargs=s2g_kwargs)
+            return ns[0, :state_dim, 0]
+
+        state_in = torch.tensor(state_np, dtype=dtype, device=dev)
+        J_t = torch.func.jacrev(step_fn)(state_in)
+        J_np = J_t.detach().cpu().numpy().astype(np.float64)
+
+        _restore_model_ctx(model, ctx)
+        next_state_np = _fwd_np(state_np)
+    else:
+        # Central finite differences with eps=1e-4 (float32-safe for actual controls)
+        eps = 1e-4
+        J_np = np.zeros((state_dim, state_dim), dtype=np.float64)
+        next_state_np = _fwd_np(state_np)
+
+        for j in range(state_dim):
+            body_j = j // BLOCK_SIZE
+
+            def _perturbed(sign: float, _j=j, _body=body_j) -> np.ndarray:
+                s = state_np.copy()
+                s[_j] += sign * eps
+                qs = _body * BLOCK_SIZE + QUAT_OFFSET
+                qn = np.linalg.norm(s[qs:qs + QUAT_SIZE])
+                if qn > 1e-8:
+                    s[qs:qs + QUAT_SIZE] /= qn
+                return s
+
+            _restore_model_ctx(model, ctx)
+            ns_fwd = _fwd_np(_perturbed(+1.0))
+            _restore_model_ctx(model, ctx)
+            ns_bwd = _fwd_np(_perturbed(-1.0))
+            J_np[:, j] = (ns_fwd - ns_bwd) / (2.0 * eps)
+
+    _restore_model_ctx(model, ctx)
+    return next_state_np, J_np

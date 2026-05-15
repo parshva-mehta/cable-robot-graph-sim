@@ -3,3 +3,5 @@
 *.pyc
 *.md
 !README.md
+rollout_states*.txt
+*.png
