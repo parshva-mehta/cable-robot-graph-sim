@@ -111,9 +111,8 @@ def evaluate(simulator,
 def evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=False):
     """Compute COM, rotation, and penetration errors from EKF frames vs gt_data.
 
-    frames[i]['state'] must be (1, state_dim, 1).  For ekf_exp mode pass
-    is_exp=True so the 36D exp-map state is converted to quat before extracting
-    pos/quat for metrics.
+    frames[i]['state'] must be (1, state_dim, 1).  Pass is_exp=True for the
+    exp-map EKF so the 36D state is converted to quat before extracting pos/quat.
     """
     if is_exp:
         from linearization_exp import exp_state_to_quat_state
@@ -209,16 +208,18 @@ def batch_compute_end_pts(sim, batch_state: torch.Tensor):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str,
-                        default="C:/Users/parshva-mehta/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
+                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/best_rollout_model.pt",
+                        #default="C:/Users/parshva-mehta/Documents/Projects/PRACSYS/Tensegrity/tensegrity/models/best_rollout_model.pt",
                         help='Path to trained .pt model file')
     parser.add_argument('--data_dir', type=str,
-                        default="C:/Users/parshva-mehta/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        default="/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
+                        #default="C:/Users/parshva-mehta/Documents/Projects/PRACSYS/Tensegrity/tensegrity/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6",
                         help='Directory with processed_data.json and extra_state_data.json')
     parser.add_argument('--output', type=str, default=None,
                         help='Output rollout text file (default derived from --mode)')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--mode', choices=['raw', 'ekf', 'ekf_exp'], default='raw',
-                        help='raw: pure GNN rollout; ekf: quat-space EKF; ekf_exp: exp-map EKF')
+    parser.add_argument('--mode', choices=['raw', 'ekf'], default='raw',
+                        help='raw: pure GNN rollout; ekf: exp-map EKF')
     parser.add_argument('--dt', type=float, default=0.01,
                         help='Timestep used by EKF modes')
     parser.add_argument('--process_noise', type=float, default=1e-6,
@@ -231,21 +232,22 @@ def main():
                         help='Reject updates with ||innovation|| > gate*sqrt(meas_dim)')
     parser.add_argument('--jac_update_period', type=int, default=5,
                         help='Recompute EKF Jacobian every N steps (1=every step, 5=5x speedup)')
+    parser.add_argument('--max_spectral_radius', type=float, default=1.0,
+                        help='Clamp threshold for EKF Jacobian spectral radius')
     parser.add_argument('--dataset_idx', type=int, default=9)
     parser.add_argument('--compare_raw', action='store_true', default=False,
                         help='Also run raw GNN rollout alongside EKF and print comparison '
-                             '(ekf/ekf_exp modes only; ratio≈1.0 means EKF not correcting)')
+                             '(ekf mode only; ratio≈1.0 means EKF not correcting)')
     parser.add_argument('--log_kalman_diagnostics', action='store_true', default=False,
                         help='Print per-step Kalman gain proxy for position block '
-                             '(ekf_exp mode only; shows innovation vs correction norms)')
+                             '(ekf mode only; shows innovation vs correction norms)')
     args = parser.parse_args()
 
     # Derive output filename from mode when not explicitly provided
     if args.output is None:
         output_names = {
-            'raw':     'rollout_states.txt',
-            'ekf':     'rollout_states_ekf.txt',
-            'ekf_exp': 'rollout_states_ekf_exp.txt',
+            'raw': 'rollout_states.txt',
+            'ekf': 'rollout_states_ekf.txt',
         }
         args.output = output_names[args.mode]
 
@@ -327,30 +329,10 @@ def main():
             simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
         )
 
-    elif args.mode == 'ekf':
-        from ekf import run_ekf_rollout as run_ekf_quat
+    else:  # ekf
+        from ekf import run_ekf_rollout
 
-        frames = run_ekf_quat(
-            simulator, gt_data, extra_data,
-            dt=args.dt,
-            process_noise_scale=args.process_noise,
-            measurement_noise_scale=args.measurement_noise,
-            observe_pose_only=args.observe_pose_only,
-            start_state=start_state,
-            use_finite_diff=True,
-            innovation_gate_sigma=args.innovation_gate,
-            dataset_idx_val=args.dataset_idx,
-            jac_update_period=args.jac_update_period,
-        )
-        write_frames_to_file(frames, args.output, mode='ekf')
-        com_err, rot_err, pen_err = evaluate_from_frames(
-            frames, gt_data, num_rods, device, is_exp=False
-        )
-
-    else:  # ekf_exp
-        from ekf_alt import run_ekf_rollout as run_ekf_exp
-
-        frames = run_ekf_exp(
+        frames = run_ekf_rollout(
             simulator, gt_data, extra_data,
             dt=args.dt,
             process_noise_scale=args.process_noise,
@@ -360,6 +342,7 @@ def main():
             use_finite_diff=False,
             innovation_gate_sigma=args.innovation_gate,
             dataset_idx_val=args.dataset_idx,
+            max_spectral_radius=args.max_spectral_radius,
             log_diagnostics=args.log_kalman_diagnostics,
         )
         write_frames_to_file(frames, args.output, mode='ekf_exp')
@@ -371,7 +354,7 @@ def main():
     print(f'Rotation Error (mean): {rot_err:.6f} rad')
     print(f'Penetration Error:     {pen_err:.6f} m')
 
-    if args.compare_raw and args.mode in ('ekf', 'ekf_exp'):
+    if args.compare_raw and args.mode == 'ekf':
         # evaluate() reinitializes cables/motor/LSTM before running, so it is
         # safe to call after the EKF has consumed the simulator.
         raw_com_err, raw_rot_err, raw_pen_err = evaluate(
