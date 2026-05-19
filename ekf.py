@@ -220,6 +220,68 @@ def _apply_exp_correction(x_quat_np: np.ndarray,
 # Core MEKF step
 # ---------------------------------------------------------------------------
 
+def _fd_inject_velocities(x_quat_np: np.ndarray,
+                          z_curr_flat: np.ndarray,
+                          z_prev_flat: np.ndarray,
+                          dt: float,
+                          n_rods: int) -> np.ndarray:
+    """Replace velocity in a quat state with finite-difference from consecutive pose measurements.
+
+    z_curr_flat / z_prev_flat: flat [x y z qw qx qy qz] * n_rods arrays.
+    """
+    x_out       = x_quat_np.copy()
+    pose_stride = 7   # [x y z qw qx qy qz]
+
+    for r in range(n_rods):
+        pos_curr  = z_curr_flat[pose_stride * r     : pose_stride * r + 3]
+        pos_prev  = z_prev_flat[pose_stride * r     : pose_stride * r + 3]
+        linvel_fd = (pos_curr - pos_prev) / dt
+
+        q_curr = z_curr_flat[pose_stride * r + 3 : pose_stride * r + 7]
+        q_prev = z_prev_flat[pose_stride * r + 3 : pose_stride * r + 7]
+        if np.dot(q_curr, q_prev) < 0:
+            q_prev = -q_prev
+        q_prev_conj = np.array([q_prev[0], -q_prev[1], -q_prev[2], -q_prev[3]])
+        w0, x0, y0, z0 = q_curr
+        w1, x1, y1, z1 = q_prev_conj
+        q_rel = np.array([
+            w0*w1 - x0*x1 - y0*y1 - z0*z1,
+            w0*x1 + x0*w1 + y0*z1 - z0*y1,
+            w0*y1 - x0*z1 + y0*w1 + z0*x1,
+            w0*z1 + x0*y1 - y0*x1 + z0*w1,
+        ])
+        vec_norm  = np.linalg.norm(q_rel[1:])
+        angle     = 2.0 * np.arctan2(vec_norm, q_rel[0])
+        if abs(angle - 2.0 * np.pi) < abs(angle):
+            angle -= 2.0 * np.pi
+        axis      = q_rel[1:] / np.sin(angle / 2.0) if vec_norm > 1e-10 else np.zeros(3)
+        angvel_fd = angle * axis / dt
+
+        qb = 13 * r
+        x_out[qb + 7  : qb + 10] = linvel_fd
+        x_out[qb + 10 : qb + 13] = angvel_fd
+
+    return x_out
+
+
+def _clamp_velocities_quat(x_quat_np: np.ndarray, n_rods: int,
+                            max_linvel: float = 3.0,
+                            max_angvel: float = 25.0) -> np.ndarray:
+    """Clamp linvel and angvel in a quat-space state to physical bounds."""
+    x_out = x_quat_np.copy()
+    for r in range(n_rods):
+        qb     = 13 * r
+        linvel = x_out[qb + 7  : qb + 10]
+        angvel = x_out[qb + 10 : qb + 13]
+        lv     = np.linalg.norm(linvel)
+        av     = np.linalg.norm(angvel)
+        if lv > max_linvel:
+            x_out[qb + 7  : qb + 10] = linvel * (max_linvel / lv)
+        if av > max_angvel:
+            x_out[qb + 10 : qb + 13] = angvel * (max_angvel / av)
+    return x_out
+
+
 def _ekf_step(x_quat_np: np.ndarray,
               P_exp: np.ndarray,
               simulator,
@@ -233,7 +295,8 @@ def _ekf_step(x_quat_np: np.ndarray,
               have_measurement: bool,
               innovation_gate_sigma: float = np.inf,
               dataset_idx_val: int = 9,
-              diagnostics: dict | None = None):
+              diagnostics: dict | None = None,
+              x_pred_quat_np: np.ndarray | None = None):
     """One MEKF predict-and-update step.
 
     Mean is kept in quat space; covariance in 36D exp-map space.
@@ -254,6 +317,10 @@ def _ekf_step(x_quat_np: np.ndarray,
         innovation_gate_sigma: Gate threshold; np.inf = no gating.
         dataset_idx_val: Passed to the graph processor.
         diagnostics: Optional dict populated with per-step diagnostics.
+        x_pred_quat_np: Pre-computed GNN prediction (39,). When provided,
+            the internal GNN call and LSTM sync are skipped — the caller
+            owns the GNN cadence. Required when batching num_out_steps steps
+            per GNN call to match sim.run's LSTM progression.
 
     Returns:
         x_post_quat: (39,) posterior quat-space state.
@@ -274,16 +341,18 @@ def _ekf_step(x_quat_np: np.ndarray,
 
     x_t = torch.tensor(x_quat_np, dtype=dtype, device=dev).reshape(1, quat_dim, 1)
 
-    # Save LSTM + cable context at time k
-    ctx_pre = _save_model_ctx(simulator)
-
     # ---- Predict mean: direct GNN step (no exp-map conversion) --------------
-    with torch.no_grad():
-        ns, _ = simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
-    x_pred_quat = ns[0, :quat_dim, 0].detach().cpu().numpy().astype(np.float64)
-
-    # Restore context (the LSTM sync at the end will re-advance from x_k)
-    _restore_model_ctx(simulator, ctx_pre)
+    if x_pred_quat_np is not None:
+        # Caller owns the GNN call; use the pre-computed prediction directly.
+        x_pred_quat = x_pred_quat_np
+    else:
+        # Save LSTM + cable context at time k so we can restore before the sync.
+        ctx_pre = _save_model_ctx(simulator)
+        with torch.no_grad():
+            ns, _ = simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
+        x_pred_quat = ns[0, :quat_dim, 0].detach().cpu().numpy().astype(np.float64)
+        # Restore context (the LSTM sync at the end will re-advance from x_k)
+        _restore_model_ctx(simulator, ctx_pre)
 
     # Sanitize F
     if not np.all(np.isfinite(F_exp)):
@@ -307,9 +376,9 @@ def _ekf_step(x_quat_np: np.ndarray,
     P_pred = _make_pd(F_exp @ P_exp @ F_exp.T + Q)
 
     if not have_measurement:
-        # LSTM sync from x_k (matches GNN rollout)
-        with torch.no_grad():
-            simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
+        if x_pred_quat_np is None:
+            with torch.no_grad():
+                simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
         return x_pred_quat, P_pred
 
     # ---- Innovation in exp-map space -----------------------------------------
@@ -330,8 +399,9 @@ def _ekf_step(x_quat_np: np.ndarray,
     # Innovation gate
     if (np.isfinite(innovation_gate_sigma) and
             np.linalg.norm(innovation) > innovation_gate_sigma * np.sqrt(innovation.size)):
-        with torch.no_grad():
-            simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
+        if x_pred_quat_np is None:
+            with torch.no_grad():
+                simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
         if diagnostics is not None:
             diagnostics['pos_correction_norm'] = 0.0
             diagnostics['gated'] = True
@@ -365,9 +435,10 @@ def _ekf_step(x_quat_np: np.ndarray,
         ]))
         diagnostics['gated'] = False
 
-    # LSTM sync from x_k (matches GNN rollout)
-    with torch.no_grad():
-        simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
+    # LSTM sync from x_k — skip when caller owns the GNN cadence.
+    if x_pred_quat_np is None:
+        with torch.no_grad():
+            simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
 
     return x_post_quat, P_post
 
@@ -385,7 +456,7 @@ class OnlineEKF:
 
     def __init__(self, simulator, dt, n_rods,
                  process_noise_scale=1e-4, measurement_noise_scale=1e-3,
-                 observe_pose_only=False, use_finite_diff=False,
+                 observe_pose_only=False, use_finite_diff=True,
                  innovation_gate_sigma=5.0,
                  exp_inflation=1.5, vel_inflation=0.5,
                  dataset_idx_val=9,
@@ -551,58 +622,13 @@ class OnlineEKF:
         """Replace EKF velocity estimates with finite-difference values from measurements."""
         if self._prev_z_quat is None:
             return x_quat_np
-
-        x_out    = x_quat_np.copy()
-        z_curr   = np.asarray(z_t, dtype=np.float64).reshape(-1)
-        z_prev   = self._prev_z_quat.reshape(-1)
-        dt       = self.dt
-        pose_stride = z_curr.size // self.n_rods  # 7 for pose-only
-
-        for r in range(self.n_rods):
-            pos_curr  = z_curr[pose_stride * r     : pose_stride * r + 3]
-            pos_prev  = z_prev[pose_stride * r     : pose_stride * r + 3]
-            linvel_fd = (pos_curr - pos_prev) / dt
-
-            q_curr = z_curr[pose_stride * r + 3 : pose_stride * r + 7]
-            q_prev = z_prev[pose_stride * r + 3 : pose_stride * r + 7]
-            if np.dot(q_curr, q_prev) < 0:
-                q_prev = -q_prev
-            q_prev_conj = np.array([q_prev[0], -q_prev[1], -q_prev[2], -q_prev[3]])
-            w0, x0, y0, z0 = q_curr
-            w1, x1, y1, z1 = q_prev_conj
-            q_rel = np.array([
-                w0*w1 - x0*x1 - y0*y1 - z0*z1,
-                w0*x1 + x0*w1 + y0*z1 - z0*y1,
-                w0*y1 - x0*z1 + y0*w1 + z0*x1,
-                w0*z1 + x0*y1 - y0*x1 + z0*w1,
-            ])
-            vec_norm = np.linalg.norm(q_rel[1:])
-            angle    = 2.0 * np.arctan2(vec_norm, q_rel[0])
-            if abs(angle - 2.0 * np.pi) < abs(angle):
-                angle -= 2.0 * np.pi
-            axis     = q_rel[1:] / np.sin(angle / 2.0) if vec_norm > 1e-10 else np.zeros(3)
-            angvel_fd = angle * axis / dt
-
-            qb = 13 * r
-            x_out[qb + 7  : qb + 10] = linvel_fd
-            x_out[qb + 10 : qb + 13] = angvel_fd
-
-        return x_out
+        z_curr = np.asarray(z_t, dtype=np.float64).reshape(-1)[:7 * self.n_rods]
+        z_prev = self._prev_z_quat.reshape(-1)[:7 * self.n_rods]
+        return _fd_inject_velocities(x_quat_np, z_curr, z_prev, self.dt, self.n_rods)
 
     def _clamp_velocities_quat(self, x_quat_np: np.ndarray) -> np.ndarray:
-        """Clamp linvel and angvel in quat-space state to physical bounds."""
-        x_out = x_quat_np.copy()
-        for r in range(self.n_rods):
-            qb     = 13 * r
-            linvel = x_out[qb + 7  : qb + 10]
-            angvel = x_out[qb + 10 : qb + 13]
-            lv_norm = np.linalg.norm(linvel)
-            av_norm = np.linalg.norm(angvel)
-            if lv_norm > self.max_linvel:
-                x_out[qb + 7  : qb + 10] = linvel * (self.max_linvel / lv_norm)
-            if av_norm > self.max_angvel:
-                x_out[qb + 10 : qb + 13] = angvel * (self.max_angvel / av_norm)
-        return x_out
+        return _clamp_velocities_quat(x_quat_np, self.n_rods,
+                                       self.max_linvel, self.max_angvel)
 
     def _convert_measurement(self, z_quat: np.ndarray) -> np.ndarray:
         """Convert a raw pos+quat measurement to pos+exp_rot."""
@@ -625,7 +651,7 @@ def run_ekf_rollout(simulator,
                     measurement_noise_scale=1e-3,
                     observe_pose_only=False,
                     start_state=None,
-                    use_finite_diff=False,
+                    use_finite_diff=True,
                     exp_inflation=1.5,
                     vel_inflation=0.5,
                     innovation_gate_sigma=5.0,
@@ -634,7 +660,8 @@ def run_ekf_rollout(simulator,
                     dataset_idx_val=9,
                     max_spectral_radius=1.0,
                     jacobian_update_interval=10,
-                    log_diagnostics=False):
+                    log_diagnostics=False,
+                    verbose=False):
     """Run a MEKF rollout over ground-truth data.
 
     Returns:
@@ -717,80 +744,125 @@ def run_ekf_rollout(simulator,
     frames.append({"time": time, "pose": pose,
                    "state": start_exp.detach().clone()})
 
-    with torch.no_grad():
-        for k, extra in enumerate(tqdm.tqdm(extra_gt_data)):
-            have_measurement = k + 1 < len(gt_data)
+    def _gt_pose_flat(d):
+        pos  = np.array(d['pos'],  dtype=np.float64).reshape(n_rods, 3)
+        quat = np.array(d['quat'], dtype=np.float64).reshape(n_rods, 4)
+        return np.hstack([pos, quat]).reshape(-1)
 
-            # state_exp_t is derived from the current quat mean (for Jacobian)
-            state_exp_t = quat_state_to_exp_state(
-                torch.tensor(x_quat_np, dtype=dtype, device=device)
-                .reshape(1, quat_dim, 1)
+    prev_pose_flat = _gt_pose_flat(gt_data[0])
+
+    num_out_steps = getattr(simulator, 'num_out_steps', 1)
+    n_extra       = len(extra_gt_data)
+    s2g = {'dataset_idx': torch.tensor([[dataset_idx_val]], dtype=torch.long, device=device)}
+
+    with torch.no_grad():
+        batch_start = 0
+        for _ in tqdm.tqdm(range(0, n_extra, num_out_steps)):
+            batch_end = min(batch_start + num_out_steps, n_extra)
+            batch     = extra_gt_data[batch_start:batch_end]
+
+            # Build multi-step control with the actual future controls for this batch.
+            ctrl_batch = torch.cat(
+                [_ensure_ctrl_for_step(b['controls'], simulator) for b in batch],
+                dim=-1,  # (1, num_cables, actual_n)
             )
 
-            ctrl_step = _ensure_ctrl_for_step(extra['controls'], simulator)
+            # One GNN call for the whole batch — matches sim.run's LSTM cadence.
+            x_t_batch = torch.tensor(
+                x_quat_np, dtype=dtype, device=device
+            ).reshape(1, quat_dim, 1)
+            ctx_batch = _save_model_ctx(simulator)
+            ns_batch, _ = simulator.step(
+                x_t_batch, ctrls=ctrl_batch, state_to_graph_kwargs=s2g
+            )
+            # ns_batch: (1, quat_dim, num_out_steps)
+            _restore_model_ctx(simulator, ctx_batch)
 
-            # Recompute Jacobian periodically
-            if cached_F is None or k % jacobian_update_interval == 0:
-                _, cached_F = linearize_dynamics_exp(
-                    simulator, state_exp_t,
-                    sample_index=dataset_idx_val,
-                    use_finite_diff=use_finite_diff,
-                    ctrls=ctrl_step,
-                    max_spectral_radius=max_spectral_radius,
-                    verbose=True,
+            for i, extra in enumerate(batch):
+                k = batch_start + i
+                x_pred_k = ns_batch[0, :quat_dim, i].cpu().numpy().astype(np.float64)
+
+                have_measurement = k + 1 < len(gt_data)
+
+                state_exp_t = quat_state_to_exp_state(
+                    torch.tensor(x_quat_np, dtype=dtype, device=device)
+                    .reshape(1, quat_dim, 1)
                 )
+                ctrl_step = _ensure_ctrl_for_step(extra['controls'], simulator)
 
-            # Build measurement in exp-map space
-            z_exp = None
-            if have_measurement:
-                gt   = gt_data[k + 1]
-                pos  = np.array(gt['pos'],  dtype=np.float64)
-                quat = np.array(gt['quat'], dtype=np.float64)
-                if observe_pose_only:
-                    z_quat = np.hstack([
-                        pos.reshape(n_rods, 3),
-                        quat.reshape(n_rods, 4)
-                    ]).reshape(-1)
-                    z_exp = _pose_quat_to_exp(z_quat, n_rods, dtype, device)
-                else:
-                    lv = np.array(gt['linvel'], dtype=np.float64)
-                    av = np.array(gt['angvel'], dtype=np.float64)
-                    z_quat_full = np.hstack([
-                        pos.reshape(n_rods, 3),
-                        quat.reshape(n_rods, 4),
-                        lv.reshape(n_rods, 3),
-                        av.reshape(n_rods, 3),
-                    ]).reshape(-1)
-                    z_exp = _full_quat_state_to_exp_np(
-                        z_quat_full, n_rods, dtype, device
+                if cached_F is None or k % jacobian_update_interval == 0:
+                    _, cached_F = linearize_dynamics_exp(
+                        simulator, state_exp_t,
+                        sample_index=dataset_idx_val,
+                        use_finite_diff=use_finite_diff,
+                        ctrls=ctrl_step,
+                        max_spectral_radius=max_spectral_radius,
+                        verbose=verbose,
                     )
 
-            step_diag = {} if log_diagnostics else None
-            x_quat_np, P_exp = _ekf_step(
-                x_quat_np, P_exp,
-                simulator, ctrl_step,
-                cached_F,
-                H_np, z_exp,
-                Q_sigmas, R_sigmas, n_rods,
-                have_measurement=have_measurement,
-                innovation_gate_sigma=innovation_gate_sigma,
-                dataset_idx_val=dataset_idx_val,
-                diagnostics=step_diag,
-            )
-            if log_diagnostics and step_diag and 'pos_innovation_norm' in step_diag:
-                _diag_innov.append(step_diag['pos_innovation_norm'])
-                _diag_corr.append(step_diag.get('pos_correction_norm', 0.0))
+                z_exp = None
+                if have_measurement:
+                    gt   = gt_data[k + 1]
+                    pos  = np.array(gt['pos'],  dtype=np.float64)
+                    quat = np.array(gt['quat'], dtype=np.float64)
+                    if observe_pose_only:
+                        z_quat = np.hstack([
+                            pos.reshape(n_rods, 3),
+                            quat.reshape(n_rods, 4)
+                        ]).reshape(-1)
+                        z_exp = _pose_quat_to_exp(z_quat, n_rods, dtype, device)
+                    else:
+                        lv = np.array(gt['linvel'], dtype=np.float64)
+                        av = np.array(gt['angvel'], dtype=np.float64)
+                        z_quat_full = np.hstack([
+                            pos.reshape(n_rods, 3),
+                            quat.reshape(n_rods, 4),
+                            lv.reshape(n_rods, 3),
+                            av.reshape(n_rods, 3),
+                        ]).reshape(-1)
+                        z_exp = _full_quat_state_to_exp_np(
+                            z_quat_full, n_rods, dtype, device
+                        )
 
-            # Build frame output in exp-map format (backward compat)
-            state_exp_out = quat_state_to_exp_state(
-                torch.tensor(x_quat_np, dtype=dtype, device=device)
-                .reshape(1, quat_dim, 1)
-            )
+                step_diag = {} if log_diagnostics else None
+                x_quat_np, P_exp = _ekf_step(
+                    x_quat_np, P_exp,
+                    simulator, ctrl_step,
+                    cached_F,
+                    H_np, z_exp,
+                    Q_sigmas, R_sigmas, n_rods,
+                    have_measurement=have_measurement,
+                    innovation_gate_sigma=innovation_gate_sigma,
+                    dataset_idx_val=dataset_idx_val,
+                    diagnostics=step_diag,
+                    x_pred_quat_np=x_pred_k,
+                )
+                if log_diagnostics and step_diag and 'pos_innovation_norm' in step_diag:
+                    _diag_innov.append(step_diag['pos_innovation_norm'])
+                    _diag_corr.append(step_diag.get('pos_correction_norm', 0.0))
 
-            time += dt
-            pose = _exp_state_to_pose_np(state_exp_out, n_rods, dtype, device)
-            frames.append({"time": time, "pose": pose,
-                           "state": state_exp_out.detach().clone()})
+                if have_measurement:
+                    curr_pose_flat = _gt_pose_flat(gt_data[k + 1])
+                    x_quat_np = _fd_inject_velocities(
+                        x_quat_np, curr_pose_flat, prev_pose_flat, dt, n_rods
+                    )
+                    x_quat_np = _clamp_velocities_quat(x_quat_np, n_rods)
+                    prev_pose_flat = curr_pose_flat
+
+                state_exp_out = quat_state_to_exp_state(
+                    torch.tensor(x_quat_np, dtype=dtype, device=device)
+                    .reshape(1, quat_dim, 1)
+                )
+                time += dt
+                pose = _exp_state_to_pose_np(state_exp_out, n_rods, dtype, device)
+                frames.append({"time": time, "pose": pose,
+                               "state": state_exp_out.detach().clone()})
+
+            # Advance LSTM once for the whole batch from the batch-start state —
+            # matches exactly the cadence sim.run uses.
+            simulator.step(x_t_batch, ctrls=ctrl_batch, state_to_graph_kwargs=s2g)
+
+            batch_start = batch_end
 
     if log_diagnostics and _diag_innov:
         mean_innov = float(np.mean(_diag_innov))
