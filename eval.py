@@ -218,8 +218,8 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='Output rollout text file (default derived from --mode)')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--mode', choices=['raw', 'ekf'], default='raw',
-                        help='raw: pure GNN rollout; ekf: exp-map EKF')
+    parser.add_argument('--mode', choices=['raw', 'ekf', 'gtsam'], default='raw',
+                        help='raw: pure GNN rollout; ekf: exp-map MEKF; gtsam: GTSAM-based MEKF')
     parser.add_argument('--dt', type=float, default=0.01,
                         help='Timestep used by EKF modes')
     parser.add_argument('--process_noise', type=float, default=1e-6,
@@ -246,8 +246,9 @@ def main():
     # Derive output filename from mode when not explicitly provided
     if args.output is None:
         output_names = {
-            'raw': 'rollout_states.txt',
-            'ekf': 'rollout_states_ekf.txt',
+            'raw':   'rollout_states.txt',
+            'ekf':   'rollout_states_ekf.txt',
+            'gtsam': 'rollout_states_gtsam.txt',
         }
         args.output = output_names[args.mode]
 
@@ -329,7 +330,7 @@ def main():
             simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
         )
 
-    else:  # ekf
+    elif args.mode == 'ekf':
         from ekf import run_ekf_rollout
 
         frames = run_ekf_rollout(
@@ -339,7 +340,28 @@ def main():
             measurement_noise_scale=args.measurement_noise,
             observe_pose_only=args.observe_pose_only,
             start_state=start_state,
-            use_finite_diff=False,
+            use_finite_diff=True,
+            innovation_gate_sigma=args.innovation_gate,
+            dataset_idx_val=args.dataset_idx,
+            max_spectral_radius=args.max_spectral_radius,
+            log_diagnostics=args.log_kalman_diagnostics,
+        )
+        write_frames_to_file(frames, args.output, mode='ekf_exp')
+        com_err, rot_err, pen_err = evaluate_from_frames(
+            frames, gt_data, num_rods, device, is_exp=True
+        )
+
+    else:  # gtsam
+        from ekf_gtsam import run_ekf_rollout as run_gtsam_rollout
+
+        frames = run_gtsam_rollout(
+            simulator, gt_data, extra_data,
+            dt=args.dt,
+            process_noise_scale=args.process_noise,
+            measurement_noise_scale=args.measurement_noise,
+            observe_pose_only=args.observe_pose_only,
+            start_state=start_state,
+            use_finite_diff=True,
             innovation_gate_sigma=args.innovation_gate,
             dataset_idx_val=args.dataset_idx,
             max_spectral_radius=args.max_spectral_radius,
@@ -354,7 +376,7 @@ def main():
     print(f'Rotation Error (mean): {rot_err:.6f} rad')
     print(f'Penetration Error:     {pen_err:.6f} m')
 
-    if args.compare_raw and args.mode == 'ekf':
+    if args.compare_raw and args.mode in ('ekf', 'gtsam'):
         # evaluate() reinitializes cables/motor/LSTM before running, so it is
         # safe to call after the EKF has consumed the simulator.
         raw_com_err, raw_rot_err, raw_pen_err = evaluate(
