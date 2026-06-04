@@ -463,7 +463,7 @@ class OnlineEKF:
                  ema_alpha=0.35,
                  max_linvel=3.0, max_angvel=25.0,
                  jacobian_update_interval=10,
-                 max_spectral_radius=1.0,
+                 max_spectral_radius=None,
                  control_jacobian_mode="simulator",
                  require_control_jacobian=False):
         self.simulator               = simulator
@@ -658,7 +658,7 @@ def run_ekf_rollout(simulator,
                     control_jacobian_mode="simulator",
                     require_control_jacobian=False,
                     dataset_idx_val=9,
-                    max_spectral_radius=1.0,
+                    max_spectral_radius=None,
                     jacobian_update_interval=10,
                     log_diagnostics=False,
                     verbose=False):
