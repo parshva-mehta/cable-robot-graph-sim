@@ -39,7 +39,11 @@ from linearization_exp import (
     linearize_dynamics_exp,
 )
 from utilities.misc_utils import DEFAULT_DTYPE
-from utilities.torch_quaternion import quat2exp  # used in _pose_quat_to_exp
+from utilities.torch_quaternion import (
+    quat2exp,
+    compute_prin_axis,
+    compute_quat_btwn_z_and_vec,
+)  # used in _pose_quat_to_exp
 
 
 # ---------------------------------------------------------------------------
@@ -105,17 +109,29 @@ def _pose_quat_to_exp(pos_quat_np: np.ndarray,
                       device: torch.device) -> np.ndarray:
     """Convert a flat pos+quat measurement to pos+exp_rot.
 
+    The GNN's quaternion output uses compute_quat_btwn_z_and_vec(principal_axis),
+    which is the minimal rotation from the z-axis to the rod's principal axis.
+    This discards axial spin (rotation around the rod's long axis), which is
+    unobservable from the GNN dynamics.  Measurement quaternions (from physics
+    simulation) may include axial spin, so we canonicalize them to the same
+    GNN convention before computing the innovation.
+
     Args:
         pos_quat_np: (7*n_rods,)  [x y z qw qx qy qz] per rod
     Returns:
-        (6*n_rods,)  [x y z ex ey ez] per rod
+        (6*n_rods,)  [x y z ex ey ez] per rod  (in GNN canonical orientation)
     """
     out = np.empty(6 * n_rods, dtype=np.float64)
     for r in range(n_rods):
         pos  = pos_quat_np[7 * r     : 7 * r + 3]
         quat = pos_quat_np[7 * r + 3 : 7 * r + 7]
-        quat_t  = torch.tensor(quat, dtype=dtype, device=device).reshape(1, 4, 1)
-        exp_rot = quat2exp(quat_t)[0, :, 0].cpu().numpy()
+        quat_t = torch.tensor(quat, dtype=dtype, device=device).reshape(1, 4, 1)
+        # Canonicalize: extract principal axis, then recover GNN-form quaternion.
+        prin_axis   = compute_prin_axis(quat_t)         # (1, 3, 1)
+        q_canonical = compute_quat_btwn_z_and_vec(
+            prin_axis.squeeze(-1)                        # (1, 3)
+        ).reshape(1, 4, 1)
+        exp_rot = quat2exp(q_canonical)[0, :, 0].cpu().numpy()
         out[6 * r     : 6 * r + 3] = pos
         out[6 * r + 3 : 6 * r + 6] = exp_rot
     return out

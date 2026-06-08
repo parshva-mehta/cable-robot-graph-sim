@@ -110,7 +110,7 @@ def run_jacobian_prediction_eval(
     eps: float = 1e-3,
     dataset_idx: int = 9,
     use_finite_diff: bool = True,
-    max_spectral_radius: float = 1.0,
+    max_spectral_radius: float | None = None,
 ) -> dict:
     """Run the Jacobian prediction diagnostic over n_steps rollout steps.
 
@@ -365,8 +365,8 @@ def main():
     parser.add_argument('--dataset_idx', type=int, default=9)
     parser.add_argument('--use_autodiff', action='store_true', default=False,
                         help='Use autodiff Jacobian (default: finite difference)')
-    parser.add_argument('--max_sr',      type=float, default=1.0,
-                        help='Spectral radius clamp for F')
+    parser.add_argument('--max_sr',      type=float, default=None,
+                        help='Spectral radius clamp for F (default: None = no clamping, matches EKF default)')
     parser.add_argument('--save_plots',  action='store_true', default=False)
     parser.add_argument('--out_dir',     default='.')
     args = parser.parse_args()

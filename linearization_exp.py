@@ -16,7 +16,7 @@ Because exp_rot lives in unconstrained R³, the Jacobian is naturally full-rank
 import numpy as np
 import torch
 
-from utilities.torch_quaternion import quat2exp, exp2quat
+from utilities.torch_quaternion import quat2exp, exp2quat, compute_prin_axis, compute_quat_btwn_z_and_vec
 from linearization import (
     N_BODIES,
     BLOCK_SIZE,
@@ -108,6 +108,41 @@ def quat_state_to_exp_state(state_quat: torch.Tensor) -> torch.Tensor:
 
     quat_flat = quat.reshape(batch * N_BODIES, 4, 1)
     exp_rot   = quat2exp(quat_flat).reshape(batch, N_BODIES, 3, 1)
+
+    exp_state = torch.cat([pos, exp_rot, vel], dim=2).reshape(batch, EXP_STATE_DIM, 1)
+    return exp_state.squeeze(-1) if squeeze else exp_state
+
+
+def quat_state_to_canonical_exp_state(state_quat: torch.Tensor) -> torch.Tensor:
+    """Convert ambient quat state (39D) to canonical GNN exp-map state (36D).
+
+    Unlike quat_state_to_exp_state, this canonicalizes each rod quaternion to the
+    GNN's principal-axis form (minimal rotation from z-axis to the rod's long axis),
+    discarding axial spin which is unobservable from the GNN dynamics.
+
+    Use only when comparing ground-truth quaternions (from physics simulation) against
+    GNN-estimated states — they use different orientation conventions.
+
+    Args:
+        state_quat: (batch, 39, 1)
+    Returns:
+        (batch, 36, 1)
+    """
+    squeeze = (state_quat.dim() == 2)
+    if squeeze:
+        state_quat = state_quat.unsqueeze(-1)
+
+    batch = state_quat.shape[0]
+    s = state_quat.reshape(batch, N_BODIES, BLOCK_SIZE, 1)
+
+    pos     = s[:, :, 0:3,  :]
+    quat    = s[:, :, 3:7,  :]
+    vel     = s[:, :, 7:13, :]
+
+    quat_flat  = quat.reshape(batch * N_BODIES, 4, 1)
+    prin_axis  = compute_prin_axis(quat_flat)[..., 0]           # (B*N, 3)
+    q_can      = compute_quat_btwn_z_and_vec(prin_axis)         # (B*N, 4)
+    exp_rot    = quat2exp(q_can.unsqueeze(-1)).reshape(batch, N_BODIES, 3, 1)
 
     exp_state = torch.cat([pos, exp_rot, vel], dim=2).reshape(batch, EXP_STATE_DIM, 1)
     return exp_state.squeeze(-1) if squeeze else exp_state

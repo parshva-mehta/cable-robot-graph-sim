@@ -49,6 +49,7 @@ from linearization_exp import (
     EXP_BLOCK_SIZE,
     EXP_STATE_DIM,
     quat_state_to_exp_state,
+    quat_state_to_canonical_exp_state,
     exp_state_to_quat_state,
     linearize_dynamics_exp,
     step_exp,
@@ -240,7 +241,14 @@ def test_linearized_prediction(model_path, data_dir, device,
                                 n_steps=5,
                                 eps=1e-3,
                                 rel_tol=0.15):
-    """F_k @ δ_k ≈ f(x_k+δ_k)-f(x_k) at each step over a short horizon.
+    """F_k @ δ ≈ f(x_k+δ)-f(x_k) checked independently at each step.
+
+    Uses a fresh pose-only perturbation at each step so the perturbation
+    magnitude stays in the linear regime regardless of F's spectral radius
+    or its large velocity rows (scaled by 1/dt).  Propagating δ across steps
+    would grow it by the Frobenius norm of F (~280) each step, leaving the
+    linear regime after 1-2 steps — a property of the dynamics, not of
+    Jacobian quality.
 
     Deviation is evaluated only on pose (pos + exp_rot) rows — the smooth,
     EKF-critical directions.  Angvel rows are excluded for the same reason as
@@ -263,13 +271,16 @@ def test_linearized_prediction(model_path, data_dir, device,
         for j in range(6)
     ])
 
+    # Fixed pose-only perturbation direction: non-zero only in pos + exp_rot blocks.
+    # Using pose-only delta keeps ‖delta‖ from exploding via the 1/dt velocity rows.
     rng = np.random.default_rng(1)
-    delta_dir = rng.standard_normal(EXP_STATE_DIM)
+    delta_dir = np.zeros(EXP_STATE_DIM, dtype=np.float64)
+    for r in range(n_rods):
+        delta_dir[EXP_BLOCK_SIZE * r : EXP_BLOCK_SIZE * r + 6] = rng.standard_normal(6)
     delta_dir /= np.linalg.norm(delta_dir)
+    delta = eps * delta_dir  # fresh same-magnitude perturbation reused at each step
 
     x_nom_quat = start.clone()
-    delta_k = eps * delta_dir.copy()  # current perturbation in exp-map space
-
     rel_errs = []
 
     with torch.no_grad():
@@ -283,8 +294,7 @@ def test_linearized_prediction(model_path, data_dir, device,
                 x_nom_exp_np, dtype=dtype, device=device
             ).reshape(1, EXP_STATE_DIM, 1)
 
-            # Save LSTM context at nominal state k.
-            # linearize_dynamics_exp restores this context on return.
+            # Linearize at nominal state k (restores LSTM on return).
             f_x_np, F_k = linearize_dynamics_exp(
                 sim, x_nom_exp_t,
                 sample_index=dataset_idx,
@@ -292,40 +302,34 @@ def test_linearized_prediction(model_path, data_dir, device,
                 ctrls=ctrl,
                 verbose=False,
             )
-            # LSTM is at ctx_k here.
 
-            # Perturbed step: same LSTM context as nominal.
+            # Perturbed step from the same LSTM context (ctx_k).
             x_pert_exp_t = torch.tensor(
-                x_nom_exp_np + delta_k, dtype=dtype, device=device
+                x_nom_exp_np + delta, dtype=dtype, device=device
             ).reshape(1, EXP_STATE_DIM, 1)
             ns_pert = step_exp(sim, x_pert_exp_t, ctrl, s2g)
             x_pert_next_exp_np = ns_pert[0, :EXP_STATE_DIM, 0].cpu().numpy().astype(np.float64)
 
-            # Nominal step: restore ctx_k, advance LSTM to ctx_{k+1}.
-            # f_x_np from linearize_dynamics_exp is already f(x_k), so we
-            # only need this call to update the LSTM to ctx_{k+1}.
-            ctx_k = _save_model_ctx(sim)  # ctx is currently ctx_k (restored by lin.)
+            # Advance nominal LSTM to ctx_{k+1}.
+            ctx_k = _save_model_ctx(sim)
             _restore_model_ctx(sim, ctx_k)
             step_exp(sim, x_nom_exp_t, ctrl, s2g)
-            # LSTM is now at ctx_{k+1}; save it for the next iteration.
             ctx_k1 = _save_model_ctx(sim)
 
             # Compare linear prediction vs actual deviation — pose rows only.
             delta_actual = x_pert_next_exp_np - f_x_np
-            delta_linear = F_k @ delta_k
+            delta_linear = F_k @ delta
 
             residual = np.linalg.norm((delta_actual - delta_linear)[pose_idx])
             ref_norm = max(np.linalg.norm(delta_actual[pose_idx]), 1e-15)
             rel_errs.append(residual / ref_norm)
 
-            # Advance for next iteration.
+            # Advance nominal trajectory for next step.
             _restore_model_ctx(sim, ctx_k1)
-            x_nom_next_exp_np = f_x_np
             x_nom_quat = exp_state_to_quat_state(
-                torch.tensor(x_nom_next_exp_np, dtype=dtype, device=device)
+                torch.tensor(f_x_np, dtype=dtype, device=device)
                 .reshape(1, EXP_STATE_DIM, 1)
             )
-            delta_k = delta_linear  # propagate perturbation linearly
 
     max_rel_err = max(rel_errs)
     ok = max_rel_err < rel_tol
@@ -430,8 +434,10 @@ def test_nees(model_path, data_dir, device, n_steps=40,
             x_true_quat[13*r+7:13*r+10] = lv[3*r:3*r+3]
             x_true_quat[13*r+10:13*r+13] = av[3*r:3*r+3]
 
+        # Use canonical exp-map for the ground truth so it matches the GNN's
+        # principal-axis quaternion convention (no axial spin).
         x_true_exp = (
-            quat_state_to_exp_state(
+            quat_state_to_canonical_exp_state(
                 torch.tensor(x_true_quat, dtype=dtype).reshape(1, -1, 1)
             ).squeeze().cpu().numpy().astype(np.float64)
         )
