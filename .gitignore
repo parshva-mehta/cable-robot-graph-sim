@@ -1,6 +1,7 @@
 .idea/
 *.mp4
 *.pyc
+__pycache__/
 *.md
 !README.md
 rollout_states*.txt
