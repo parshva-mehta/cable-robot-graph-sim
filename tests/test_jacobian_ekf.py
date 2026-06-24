@@ -129,10 +129,10 @@ def _reset_sim(sim, extra_data, device):
 #      (first-order convergence → ratio ≈ 100×, threshold is conservative)
 # ---------------------------------------------------------------------------
 
-def test_jacobian_quality(model_path, data_dir, device,
-                           warm_up_steps=5,
-                           rel_tol=0.05,
-                           convergence_min_ratio=3.0):
+def run_jacobian_quality(model_path, data_dir, device,
+                          warm_up_steps=5,
+                          rel_tol=0.05,
+                          convergence_min_ratio=3.0):
     """F@δ ≈ f(x+δ)-f(x) with second-order residual, checked on pose rows.
 
     Angular velocity (angvel) rows are excluded from the check because the
@@ -237,10 +237,10 @@ def test_jacobian_quality(model_path, data_dir, device,
 # If F is wrong, the predicted deviation will disagree with the actual one.
 # ---------------------------------------------------------------------------
 
-def test_linearized_prediction(model_path, data_dir, device,
-                                n_steps=5,
-                                eps=1e-3,
-                                rel_tol=0.15):
+def run_linearized_prediction(model_path, data_dir, device,
+                               n_steps=5,
+                               eps=1e-3,
+                               rel_tol=0.15):
     """F_k @ δ ≈ f(x_k+δ)-f(x_k) checked independently at each step.
 
     Uses a fresh pose-only perturbation at each step so the perturbation
@@ -356,8 +356,8 @@ def test_linearized_prediction(model_path, data_dir, device,
 #   normalized NEES in [nees_lo, nees_hi] = [0.05, 20]
 # ---------------------------------------------------------------------------
 
-def test_nees(model_path, data_dir, device, n_steps=40,
-              nees_lo=0.05, nees_hi=20.0):
+def run_nees(model_path, data_dir, device, n_steps=40,
+             nees_lo=0.05, nees_hi=20.0):
     """Normalized pose NEES ≈ 1 for a filter with a well-calibrated Jacobian."""
     print("\n=== Test 3: NEES consistency ===")
     sim, gt_data, extra_data = _load_assets(model_path, data_dir, device)
@@ -483,17 +483,17 @@ _DEV = torch.device("cpu")
 
 @_SKIP
 def test_pytest_jacobian_quality():
-    assert test_jacobian_quality(_DEFAULT_MODEL, _DEFAULT_DATA, _DEV)
+    assert run_jacobian_quality(_DEFAULT_MODEL, _DEFAULT_DATA, _DEV)
 
 
 @_SKIP
 def test_pytest_linearized_prediction():
-    assert test_linearized_prediction(_DEFAULT_MODEL, _DEFAULT_DATA, _DEV)
+    assert run_linearized_prediction(_DEFAULT_MODEL, _DEFAULT_DATA, _DEV)
 
 
 @_SKIP
 def test_pytest_nees():
-    assert test_nees(_DEFAULT_MODEL, _DEFAULT_DATA, _DEV)
+    assert run_nees(_DEFAULT_MODEL, _DEFAULT_DATA, _DEV)
 
 
 # ---------------------------------------------------------------------------
@@ -523,15 +523,15 @@ def main():
 
     results = {}
     if args.test in ("jacobian", "all"):
-        results["jacobian_quality"] = test_jacobian_quality(
+        results["jacobian_quality"] = run_jacobian_quality(
             args.model_path, args.data_dir, device
         )
     if args.test in ("prediction", "all"):
-        results["linearized_prediction"] = test_linearized_prediction(
+        results["linearized_prediction"] = run_linearized_prediction(
             args.model_path, args.data_dir, device, n_steps=5
         )
     if args.test in ("nees", "all"):
-        results["nees"] = test_nees(
+        results["nees"] = run_nees(
             args.model_path, args.data_dir, device, n_steps=args.n_steps
         )
 

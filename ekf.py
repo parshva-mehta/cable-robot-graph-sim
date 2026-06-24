@@ -35,6 +35,7 @@ from linearization_exp import (
     EXP_BLOCK_SIZE,
     EXP_STATE_DIM,
     quat_state_to_exp_state,
+    quat_state_to_canonical_exp_state,
     exp_state_to_quat_state,
     linearize_dynamics_exp,
 )
@@ -141,9 +142,16 @@ def _full_quat_state_to_exp_np(state_13n: np.ndarray,
                                 n_rods: int,
                                 dtype: torch.dtype,
                                 device: torch.device) -> np.ndarray:
-    """Convert a full 13*n_rods quat state vector to 12*n_rods exp state."""
+    """Convert a full 13*n_rods quat MEASUREMENT to 12*n_rods exp state.
+
+    Both call sites pass a measurement sourced from physics simulation, whose
+    quaternions may carry axial spin the GNN never represents.  We canonicalize
+    to the GNN's principal-axis convention (same as the pose-only path's
+    `_pose_quat_to_exp`); using the non-canonical `quat_state_to_exp_state`
+    here puts the rotation innovation in the wrong frame and diverges the filter.
+    """
     t = torch.tensor(state_13n, dtype=dtype, device=device).reshape(1, -1, 1)
-    return quat_state_to_exp_state(t)[0, :, 0].cpu().numpy().astype(np.float64)
+    return quat_state_to_canonical_exp_state(t)[0, :, 0].cpu().numpy().astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -633,13 +641,30 @@ class OnlineEKF:
                                + (1.0 - self.ema_alpha) * self._ema_state)
         return self._ema_state
 
+    def _pose_flat_from_measurement(self, z: np.ndarray) -> np.ndarray:
+        """Return a (7*n_rods,) [pos quat] array from a measurement.
+
+        Handles both layouts: pose-only (7 per rod, contiguous) and full-state
+        (13 per rod, interleaved pos/quat/linvel/angvel).  `_fd_inject_velocities`
+        requires a stride-7 pose array, so a plain `[:7*n_rods]` slice silently
+        reads the wrong elements for rod >= 1 in the full-state case.
+        """
+        z = np.asarray(z, dtype=np.float64).reshape(-1)
+        n = self.n_rods
+        if z.size == 13 * n:                       # full-state: extract pos+quat
+            out = np.empty(7 * n, dtype=np.float64)
+            for r in range(n):
+                out[7 * r:7 * r + 7] = z[13 * r:13 * r + 7]
+            return out
+        return z[:7 * n].copy()                    # pose-only: already stride-7
+
     def _inject_fd_velocities(self, x_quat_np: np.ndarray,
                                z_t: np.ndarray) -> np.ndarray:
         """Replace EKF velocity estimates with finite-difference values from measurements."""
         if self._prev_z_quat is None:
             return x_quat_np
-        z_curr = np.asarray(z_t, dtype=np.float64).reshape(-1)[:7 * self.n_rods]
-        z_prev = self._prev_z_quat.reshape(-1)[:7 * self.n_rods]
+        z_curr = self._pose_flat_from_measurement(z_t)
+        z_prev = self._pose_flat_from_measurement(self._prev_z_quat)
         return _fd_inject_velocities(x_quat_np, z_curr, z_prev, self.dt, self.n_rods)
 
     def _clamp_velocities_quat(self, x_quat_np: np.ndarray) -> np.ndarray:
