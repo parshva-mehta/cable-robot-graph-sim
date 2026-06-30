@@ -276,7 +276,7 @@ class OnlineEKF:
                  ema_alpha=0.35,
                  max_linvel=3.0, max_angvel=25.0,
                  jacobian_update_interval=10,
-                 max_spectral_radius=1.0,
+                 max_spectral_radius=None,
                  control_jacobian_mode="simulator",
                  require_control_jacobian=False):
         self.simulator               = simulator
@@ -418,11 +418,28 @@ class OnlineEKF:
                                + (1.0 - self.ema_alpha) * self._ema_state)
         return self._ema_state
 
+    def _pose_flat_from_measurement(self, z: np.ndarray) -> np.ndarray:
+        """Return a (7*n_rods,) [pos quat] array from a measurement.
+
+        Handles both layouts: pose-only (7 per rod, contiguous) and full-state
+        (13 per rod, interleaved pos/quat/linvel/angvel).  `_fd_inject_velocities`
+        requires a stride-7 pose array, so a plain `[:7*n_rods]` slice silently
+        reads the wrong elements for rod >= 1 in the full-state case.
+        """
+        z = np.asarray(z, dtype=np.float64).reshape(-1)
+        n = self.n_rods
+        if z.size == 13 * n:                       # full-state: extract pos+quat
+            out = np.empty(7 * n, dtype=np.float64)
+            for r in range(n):
+                out[7 * r:7 * r + 7] = z[13 * r:13 * r + 7]
+            return out
+        return z[:7 * n].copy()                    # pose-only: already stride-7
+
     def _inject_fd_velocities(self, x_quat_np, z_t):
         if self._prev_z_quat is None:
             return x_quat_np
-        z_curr = np.asarray(z_t, dtype=np.float64).reshape(-1)[:7 * self.n_rods]
-        z_prev = self._prev_z_quat.reshape(-1)[:7 * self.n_rods]
+        z_curr = self._pose_flat_from_measurement(z_t)
+        z_prev = self._pose_flat_from_measurement(self._prev_z_quat)
         return _fd_inject_velocities(x_quat_np, z_curr, z_prev, self.dt, self.n_rods)
 
     def _clamp_velocities_quat(self, x_quat_np):
@@ -456,7 +473,7 @@ def run_ekf_rollout(simulator,
                     control_jacobian_mode="simulator",
                     require_control_jacobian=False,
                     dataset_idx_val=9,
-                    max_spectral_radius=1.0,
+                    max_spectral_radius=None,
                     jacobian_update_interval=10,
                     log_diagnostics=False,
                     verbose=False):
