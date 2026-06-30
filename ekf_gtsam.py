@@ -92,12 +92,24 @@ def _gtsam_update(x_pred_exp: np.ndarray,
     gfg = gtsam.GaussianFactorGraph()
 
     # Factor 1: prediction prior   ||I·x - x_pred_exp||²_{P_pred}
-    prior_noise = gtsam.noiseModel.Gaussian.Covariance(P_pred_pd)
+    # This gtsam build's JacobianFactor only accepts a Diagonal noise model, so
+    # whiten the full-covariance prior by hand.  With W such that Wᵀ W = P_pred⁻¹,
+    #   ||W·x - W·x_pred||²_unit = (x - x_pred)ᵀ P_pred⁻¹ (x - x_pred),
+    # which is the same Gaussian prior and contributes Wᵀ W = P_pred⁻¹ to the
+    # posterior information matrix recovered below.
+    #
+    # Whiten from the eigendecomposition rather than cholesky(inv(P_pred)): a
+    # blown-up P_pred (unclamped Jacobian) can be conditioned past float64
+    # precision, so an explicit inverse loses positive-definiteness.  With
+    # P_pred = V diag(λ) Vᵀ (λ floored > 0), W = diag(1/√λ) Vᵀ is exact and stable.
+    _evals, _evecs = np.linalg.eigh(P_pred_pd)
+    _evals = np.maximum(_evals, 1e-12)
+    W_prior = (_evecs / np.sqrt(_evals)).T.astype(np.float64)
     gfg.add(gtsam.JacobianFactor(
         key,
-        np.eye(state_dim, dtype=np.float64),
-        x_pred_exp.astype(np.float64),
-        prior_noise,
+        W_prior,
+        W_prior @ x_pred_exp.astype(np.float64),
+        gtsam.noiseModel.Diagonal.Sigmas(np.ones(state_dim, dtype=np.float64)),
     ))
 
     # Factor 2: measurement   ||H·x - z||²_R
