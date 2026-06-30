@@ -16,7 +16,7 @@ Because exp_rot lives in unconstrained R³, the Jacobian is naturally full-rank
 import numpy as np
 import torch
 
-from utilities.torch_quaternion import quat2exp, exp2quat
+from utilities.torch_quaternion import quat2exp, exp2quat, compute_prin_axis, compute_quat_btwn_z_and_vec
 from linearization import (
     N_BODIES,
     BLOCK_SIZE,
@@ -28,6 +28,59 @@ from linearization import (
 
 EXP_BLOCK_SIZE = 12
 EXP_STATE_DIM  = N_BODIES * EXP_BLOCK_SIZE   # 36
+
+
+# ---------------------------------------------------------------------------
+# Structural velocity-row override (Option B)
+# ---------------------------------------------------------------------------
+
+def _structural_velocity_rows(
+    F: np.ndarray,
+    dt: float,
+    n_rods: int = N_BODIES,
+) -> np.ndarray:
+    """Replace non-smooth velocity output rows with analytically derived kinematics.
+
+    The GNN predicts body poses (pos, rot); velocities are kinematic reconstructions:
+        linvel_next  = (pos_next  - pos_in)     / dt
+        angvel_next ≈ (rot_next  - rot_in)     / dt   (first-order exp-map approximation)
+
+    Differentiating these gives:
+        ∂linvel_next/∂x = (∂pos_next/∂x  - D_pos) / dt
+        ∂angvel_next/∂x = (∂rot_next/∂x  - D_rot) / dt
+
+    where D_pos (D_rot) is a selection matrix that picks pos (exp_rot) from x_in.
+    This avoids the acos/1/dt singularity in the naive FD velocity rows.
+
+    The angvel formula is exact for linvel; for angvel it is the first-order
+    exp-map approximation (exact for small Δrot, consistent near identity).
+
+    Args:
+        F:      (EXP_STATE_DIM, EXP_STATE_DIM) Jacobian to modify in-place copy.
+        dt:     simulator timestep (seconds).
+        n_rods: number of rigid bodies (default N_BODIES = 3).
+
+    Returns:
+        F_out with velocity rows replaced analytically; pose rows unchanged.
+    """
+    F_out = F.copy()
+    for r in range(n_rods):
+        base = r * EXP_BLOCK_SIZE
+        pos_out = slice(base + 0, base + 3)
+        rot_out = slice(base + 3, base + 6)
+        lv_out  = slice(base + 6, base + 9)
+        av_out  = slice(base + 9, base + 12)
+
+        D_pos = np.zeros((3, EXP_STATE_DIM))
+        D_pos[:, base + 0:base + 3] = np.eye(3)
+
+        D_rot = np.zeros((3, EXP_STATE_DIM))
+        D_rot[:, base + 3:base + 6] = np.eye(3)
+
+        F_out[lv_out, :] = (F[pos_out, :] - D_pos) / dt
+        F_out[av_out, :] = (F[rot_out, :] - D_rot) / dt
+
+    return F_out
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +108,41 @@ def quat_state_to_exp_state(state_quat: torch.Tensor) -> torch.Tensor:
 
     quat_flat = quat.reshape(batch * N_BODIES, 4, 1)
     exp_rot   = quat2exp(quat_flat).reshape(batch, N_BODIES, 3, 1)
+
+    exp_state = torch.cat([pos, exp_rot, vel], dim=2).reshape(batch, EXP_STATE_DIM, 1)
+    return exp_state.squeeze(-1) if squeeze else exp_state
+
+
+def quat_state_to_canonical_exp_state(state_quat: torch.Tensor) -> torch.Tensor:
+    """Convert ambient quat state (39D) to canonical GNN exp-map state (36D).
+
+    Unlike quat_state_to_exp_state, this canonicalizes each rod quaternion to the
+    GNN's principal-axis form (minimal rotation from z-axis to the rod's long axis),
+    discarding axial spin which is unobservable from the GNN dynamics.
+
+    Use only when comparing ground-truth quaternions (from physics simulation) against
+    GNN-estimated states — they use different orientation conventions.
+
+    Args:
+        state_quat: (batch, 39, 1)
+    Returns:
+        (batch, 36, 1)
+    """
+    squeeze = (state_quat.dim() == 2)
+    if squeeze:
+        state_quat = state_quat.unsqueeze(-1)
+
+    batch = state_quat.shape[0]
+    s = state_quat.reshape(batch, N_BODIES, BLOCK_SIZE, 1)
+
+    pos     = s[:, :, 0:3,  :]
+    quat    = s[:, :, 3:7,  :]
+    vel     = s[:, :, 7:13, :]
+
+    quat_flat  = quat.reshape(batch * N_BODIES, 4, 1)
+    prin_axis  = compute_prin_axis(quat_flat)[..., 0]           # (B*N, 3)
+    q_can      = compute_quat_btwn_z_and_vec(prin_axis)         # (B*N, 4)
+    exp_rot    = quat2exp(q_can.unsqueeze(-1)).reshape(batch, N_BODIES, 3, 1)
 
     exp_state = torch.cat([pos, exp_rot, vel], dim=2).reshape(batch, EXP_STATE_DIM, 1)
     return exp_state.squeeze(-1) if squeeze else exp_state
@@ -193,10 +281,23 @@ def linearize_dynamics_exp(
     sample_index: int = 0,
     use_finite_diff: bool = False,
     ctrls=None,
-    max_spectral_radius: float = 1.0,
+    max_spectral_radius: float | None = None,
     verbose: bool = False,
+    structural_velocity_rows: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Linearize the exp-map-wrapped one-step dynamics at *state_exp*.
+
+    structural_velocity_rows (default True):
+        Replace the non-smooth FD velocity-output rows (linvel/angvel) with
+        analytically derived kinematic rows from _structural_velocity_rows.
+        The GNN predicts poses only; velocities are 1/dt reconstructions, so
+        naive FD through them is non-convergent.  The analytical rows use only
+        the clean pose-block rows and are well-conditioned.
+
+    max_spectral_radius (default None = no clamping):
+        When set, eigenvalues of J exceeding this magnitude are clamped.
+        Leave as None for Jacobian accuracy; set in the EKF if filter
+        instability is observed.
 
     Returns
     -------
@@ -227,14 +328,22 @@ def linearize_dynamics_exp(
         return ns[0, :EXP_STATE_DIM, 0].detach().cpu().numpy().astype(np.float64)
 
     if not use_finite_diff:
+        # Restore context once before the forward pass.  torch.autograd.functional.jacobian
+        # calls step_fn exactly once (forward) then does EXP_STATE_DIM backward VJPs without
+        # re-entering step_fn, so model side-effects (ctrls_hist, hidden_state) are safe.
+        # torch.func.jacrev / vmap is intentionally avoided here: it requires a pure function
+        # but step_fn mutates model state, causing ~10 000× inflated spurious gradients.
+        _restore_model_ctx(model, ctx)
+
         def step_fn(x_flat: torch.Tensor) -> torch.Tensor:
-            _restore_model_ctx(model, ctx)
             x = x_flat.reshape(1, EXP_STATE_DIM, 1)
             ns = step_exp(model, x, nominal_ctrls, s2g_kwargs)
             return ns[0, :EXP_STATE_DIM, 0]
 
         state_in = torch.tensor(state_exp_np, dtype=dtype, device=dev)
-        J_np     = torch.func.jacrev(step_fn)(state_in).detach().cpu().numpy().astype(np.float64)
+        J_np = torch.autograd.functional.jacobian(
+            step_fn, state_in, vectorize=False
+        ).detach().cpu().numpy().astype(np.float64)
 
         _restore_model_ctx(model, ctx)
         next_state_np = _fwd_np(state_exp_np, nominal_ctrls)
@@ -256,9 +365,9 @@ def linearize_dynamics_exp(
             sb = state_exp_np.copy(); sb[j] -= eps
 
             _restore_model_ctx(model, ctx)
-            nsf = _fwd_np(sf)
+            nsf = _fwd_np(sf, nominal_ctrls)
             _restore_model_ctx(model, ctx)
-            nsb = _fwd_np(sb)
+            nsb = _fwd_np(sb, nominal_ctrls)
 
             J_np[:, j] = (nsf - nsb) / (2.0 * eps)
 
@@ -267,8 +376,13 @@ def linearize_dynamics_exp(
     # state left over from the last forward pass above.
     _restore_model_ctx(model, ctx)
 
-    J_np, sr_raw, sr_fixed = _clamp_spectral_radius(J_np, max_spectral_radius)
-    if verbose and sr_raw > max_spectral_radius * 1.01:
-        print(f"  [exp SR clamp] raw SR={sr_raw:.4f} → clamped to {sr_fixed:.4f}")
+    if structural_velocity_rows:
+        dt_val = float(model.data_processor.dt.squeeze())
+        J_np = _structural_velocity_rows(J_np, dt_val, N_BODIES)
+
+    if max_spectral_radius is not None:
+        J_np, sr_raw, sr_fixed = _clamp_spectral_radius(J_np, max_spectral_radius)
+        if verbose and sr_raw > max_spectral_radius * 1.01:
+            print(f"  [exp SR clamp] raw SR={sr_raw:.4f} → clamped to {sr_fixed:.4f}")
 
     return next_state_np, J_np

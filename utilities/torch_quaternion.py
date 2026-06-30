@@ -420,6 +420,13 @@ def compute_prin_axis(quat):
 def quat2exp(quat, eps=1e-8):
     quat = quat / quat.norm(dim=1, keepdim=True)
 
+    # Canonicalize: flip quaternion if qw < 0 so the exp-map norm stays in [0, pi].
+    # Without this, physically identical rotations (q and -q) produce exp-maps that
+    # differ by ~2*pi in direction, breaking EKF innovation near 180-degree rotations.
+    w = quat[:, :1]
+    sign = torch.where(w < 0, torch.full_like(w, -1.0), torch.ones_like(w))
+    quat = quat * sign
+
     v = quat[:, 1:]
     w = quat[:, :1]
 
