@@ -18,7 +18,17 @@
       "Bash(C:\\\\Users\\\\parshva-mehta\\\\miniconda3\\\\envs\\\\cable_robot_gnn\\\\python.exe test_gtsam.py)",
       "Bash(conda env *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(awk '{print $2, $11, $12}')",
+      "Bash(grep -v \"^\\\\s*$\")",
+      "Read(//Users/parshvamehta/PRACSYS/cablegraphrobot/**)",
+      "Bash(ls -la tensegrity/data_sets/)",
+      "Bash(ls -la cable-robot-graph-sim/data_sets/)",
+      "Bash(find /Users/parshvamehta/PRACSYS/cablegraphrobot -maxdepth 3 -type d -name \"data_sets\")",
+      "Bash(unzip -l \"Correct Motor Encoder/2026-06-17_11-42-54.zip\")",
+      "Bash(unzip -l \"No Motor Encoders/ok1.zip\")",
+      "Bash(/opt/homebrew/Caskroom/miniconda/base/envs/cable_robot_gnn/bin/python3 -c 'import numpy,sys; print\\(sys.executable, numpy.__version__\\)')"
     ]
   }
 }

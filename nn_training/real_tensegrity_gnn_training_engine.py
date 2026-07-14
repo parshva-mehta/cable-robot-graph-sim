@@ -383,6 +383,10 @@ class RealTensegrityMultiSimMultiStepMotorGNNTrainingEngine(TensegrityMultiSimMu
             )
             num_steps = [round((times[i][e] - times[i][s]) / self.dt)
                          for s, e in zip(idx_starts, idx_ends)]
+            if len(num_steps) == 0:
+                # trajectory too short to fit an n-step-ahead window + remainder
+                self.logger.info(f'Eval {n}-steps: {data_names[i]} skipped (too short)')
+                continue
             max_steps, min_steps = max(num_steps), min(num_steps)
             num_steps = [num - min_steps for num in num_steps]
 

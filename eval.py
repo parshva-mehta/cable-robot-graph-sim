@@ -154,6 +154,112 @@ def evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=False):
     )
 
 
+def _states_to_rod_poses(states, n_rods, stride):
+    """Extract per-rod (pos+quat) poses from a list of flat state tensors.
+
+    states: iterable of tensors that flatten to (n_rods*stride,), where each
+            rod block begins with 3 pos + 4 quat values.
+    Returns a list of (n_rods, 7) CPU tensors, one per timestep.
+    """
+    poses = []
+    for s in states:
+        flat = s.reshape(-1).cpu()
+        poses.append(torch.stack([flat[r * stride:r * stride + 7] for r in range(n_rods)]))
+    return poses
+
+
+def _gt_to_rod_poses(gt_data, n_rods):
+    """Build per-rod (pos+quat) poses from the gt_data json list."""
+    poses = []
+    for d in gt_data:
+        rods = [
+            torch.tensor(
+                d['pos'][r * 3:(r + 1) * 3] + d['quat'][r * 4:(r + 1) * 4],
+                dtype=DEFAULT_DTYPE,
+            )
+            for r in range(n_rods)
+        ]
+        poses.append(torch.stack(rods))
+    return poses
+
+
+def _frames_to_rod_poses(frames, n_rods, is_exp=True):
+    """Extract per-rod (pos+quat) poses from EKF frames."""
+    if is_exp:
+        from linearization_exp import exp_state_to_quat_state
+    states = []
+    for frame in frames:
+        state_t = frame['state']  # (1, state_dim, 1)
+        if is_exp:
+            state_t = exp_state_to_quat_state(state_t)  # → (1, 13*n_rods, 1)
+        states.append(state_t)
+    return _states_to_rod_poses(states, n_rods, stride=13)
+
+
+def pairwise_pose_error(poses_a, poses_b, device, label_a='A', label_b='B'):
+    """COM (MSE) and rotation (mean angle) error between two pose sequences.
+
+    poses_a / poses_b: lists of (n_rods, 7) tensors. Compares from t=1 onward
+    (t=0 is the shared initial state). Returns (com_mse, rot_err) averaged over
+    all rods and timesteps.
+    """
+    num_steps = min(len(poses_a), len(poses_b))
+    com_errs, rot_errs = [], []
+    for i in range(1, num_steps):
+        pa, pb = poses_a[i], poses_b[i]
+        for r in range(pa.shape[0]):
+            pos_a = pa[r, :3].reshape(1, 3).to(device)
+            pos_b = pb[r, :3].reshape(1, 3).to(device)
+            quat_a = pa[r, 3:7].reshape(1, 4).to(device)
+            quat_b = pb[r, 3:7].reshape(1, 4).to(device)
+
+            com_errs.append(((pos_a - pos_b) ** 2).mean().item())
+            ang = torch_quaternion.compute_angle_btwn_quats(quat_a, quat_b)
+            rot_errs.append(ang.mean().item())
+
+    if not com_errs:
+        return 0.0, 0.0
+    return sum(com_errs) / len(com_errs), sum(rot_errs) / len(rot_errs)
+
+
+def run_raw_gnn_poses(simulator, gt_data, ctrls,
+                      init_rest_lengths, init_motor_speeds, num_rods):
+    """Reset sim state and run a raw GNN rollout; return per-rod pose sequence.
+
+    Mirrors evaluate()'s reset logic so the rollout matches the raw baseline,
+    but returns the (n_rods, 7) poses (incl. t=0) instead of aggregate errors.
+    """
+    cables = list(simulator.robot.actuated_cables.values())
+    dev = cables[0]._rest_length.device
+    for i, c in enumerate(cables):
+        c.actuation_length = c._rest_length - torch.tensor(
+            init_rest_lengths[i], dtype=DEFAULT_DTYPE
+        ).reshape(1, 1, 1).to(dev)
+        c.motor.motor_state.omega_t = torch.tensor(
+            init_motor_speeds[i], dtype=DEFAULT_DTYPE
+        ).reshape(1, 1, 1).to(dev)
+
+    simulator.ctrls_hist = None
+    simulator.node_hidden_state = None
+
+    d0 = gt_data[0]
+    pos, quat = d0['pos'], d0['quat']
+    linvel, angvel = d0['linvel'], d0['angvel']
+    state_vals = []
+    for r in range(num_rods):
+        state_vals.extend(
+            pos[r * 3:(r + 1) * 3] + quat[r * 4:(r + 1) * 4]
+            + linvel[r * 3:(r + 1) * 3] + angvel[r * 3:(r + 1) * 3]
+        )
+    start_state = torch.tensor(state_vals, dtype=DEFAULT_DTYPE).reshape(1, -1, 1).to(dev)
+
+    with torch.no_grad():
+        rollout_poses = rollout_by_ctrls(simulator, ctrls, start_state)
+
+    # rollout_by_ctrls returns (1, 7*num_rods, 1) per step (stride 7, already de-interleaved)
+    return _states_to_rod_poses(rollout_poses, num_rods, stride=7)
+
+
 def write_frames_to_file(frames, output_path, mode):
     """Write EKF frames to a rollout_states-format text file."""
     if mode == 'ekf_exp':
@@ -355,18 +461,28 @@ def main():
     print(f'Penetration Error:     {pen_err:.6f} m')
 
     if args.compare_raw and args.mode == 'ekf':
-        # evaluate() reinitializes cables/motor/LSTM before running, so it is
-        # safe to call after the EKF has consumed the simulator.
-        raw_com_err, raw_rot_err, raw_pen_err = evaluate(
-            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
+        # run_raw_gnn_poses() reinitializes cables/motor/LSTM before running, so
+        # it is safe to call after the EKF has consumed the simulator.
+        gnn_poses = run_raw_gnn_poses(
+            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds, num_rods
         )
-        print(f'\n=== Raw GNN baseline (for comparison) ===')
-        print(f'COM Error (MSE):       {raw_com_err:.6f} m\u00b2')
-        print(f'Rotation Error (mean): {raw_rot_err:.6f} rad')
-        print(f'Penetration Error:     {raw_pen_err:.6f} m')
-        if raw_com_err > 1e-12:
-            ratio = com_err / raw_com_err
-            print(f'EKF/raw COM ratio: {ratio:.3f}  '
+        ekf_poses = _frames_to_rod_poses(frames, num_rods, is_exp=True)
+        gt_poses = _gt_to_rod_poses(gt_data, num_rods)
+
+        # Pairwise pose errors between the prediction algorithms and ground truth.
+        ekf_gt_com, ekf_gt_rot = pairwise_pose_error(ekf_poses, gt_poses, device)
+        gnn_gt_com, gnn_gt_rot = pairwise_pose_error(gnn_poses, gt_poses, device)
+        ekf_gnn_com, ekf_gnn_rot = pairwise_pose_error(ekf_poses, gnn_poses, device)
+
+        print(f'\n=== Pose-algorithm comparison (COM MSE m\u00b2 / rotation rad) ===')
+        print(f'{"pair":<16}{"COM Error":>14}{"Rotation Error":>18}')
+        print(f'{"EKF  vs GT":<16}{ekf_gt_com:>14.6f}{ekf_gt_rot:>18.6f}')
+        print(f'{"GNN  vs GT":<16}{gnn_gt_com:>14.6f}{gnn_gt_rot:>18.6f}')
+        print(f'{"EKF  vs GNN":<16}{ekf_gnn_com:>14.6f}{ekf_gnn_rot:>18.6f}')
+
+        if gnn_gt_com > 1e-12:
+            ratio = ekf_gt_com / gnn_gt_com
+            print(f'\nEKF/GNN COM ratio (vs GT): {ratio:.3f}  '
                   f'(< 1.0 = EKF improves, \u2248 1.0 = EKF not correcting position)')
 
 

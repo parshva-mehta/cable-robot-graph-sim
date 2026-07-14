@@ -1,0 +1,22 @@
+{
+  "sim_config": "simulators/configs/3_bar_gnn_sim_config.json",
+  "num_steps_fwd": 1,
+  "batch_size": 128,
+  "trainable_params": [
+  ],
+  "optimizer_params": {
+    "lr": 1e-4,
+    "weight_decay": 0.01
+  },
+  "data_root": "../tensegrity/data_sets/new_platform_processed/",
+  "train_data_paths": [
+    "dataset_0/real_2026-06-17_11-42-54",
+    "dataset_0/real_2026-04-20_17-28-27_seg1"
+  ],
+  "val_data_paths": [
+    "dataset_0/real_2026-04-20_17-28-27_seg0"
+  ],
+  "load_sim": false,
+  "load_sim_path": "../tensegrity/models/best_rollout_model.pt",
+  "output_path": "../tensegrity/models_newds/"
+}
