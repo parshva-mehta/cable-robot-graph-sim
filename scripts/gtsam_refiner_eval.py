@@ -124,7 +124,7 @@ def _run_ekf(sim, gt_data, extra_data, device, **ekf_kwargs):
         sim, gt_data, extra_data,
         start_state=start,
         observe_pose_only=True,
-        dataset_idx_val=9,
+        dataset_idx_val=0,
         **ekf_kwargs,
     )
     n_rods = len(sim.robot.rigid_bodies)
@@ -296,7 +296,7 @@ def _make_nees_capturing_wrapper(nees_records):
 
     def _nees_step(x_quat_np, P_exp, simulator, ctrl, F_exp, H_np, z_exp,
                    Q_sigmas, R_sigmas, n_rods, have_measurement,
-                   innovation_gate_sigma=np.inf, dataset_idx_val=9,
+                   innovation_gate_sigma=np.inf, dataset_idx_val=0,
                    diagnostics=None, x_pred_quat_np=None):
         x_post, P_post = _orig(
             x_quat_np, P_exp, simulator, ctrl, F_exp, H_np, z_exp,
@@ -361,7 +361,7 @@ def phase4_diagnostics(model_path, dataset_root, traj, device,
             process_noise_scale=process_noise,
             measurement_noise_scale=measurement_noise,
             observe_pose_only=True,
-            dataset_idx_val=9,
+            dataset_idx_val=0,
             log_diagnostics=True,
             jacobian_update_interval=5,
         )
@@ -422,7 +422,7 @@ def phase5_gating(model_path, dataset_root, traj, device,
 
     def _capture_diag(x_quat_np, P_exp, simulator, ctrl, F_exp, H_np, z_exp,
                       Q_sigmas, R_sigmas, n_rods_inner, have_measurement,
-                      innovation_gate_sigma=np.inf, dataset_idx_val=9,
+                      innovation_gate_sigma=np.inf, dataset_idx_val=0,
                       diagnostics=None, x_pred_quat_np=None):
         diag = {} if diagnostics is None else diagnostics
         x_post, P_post = _orig(
@@ -445,7 +445,7 @@ def phase5_gating(model_path, dataset_root, traj, device,
             measurement_noise_scale=1e-1,
             observe_pose_only=True,
             innovation_gate_sigma=3.0,
-            dataset_idx_val=9,
+            dataset_idx_val=0,
             log_diagnostics=True,
         )
     finally:
@@ -493,7 +493,7 @@ def phase5_missing_measurements(model_path, dataset_root, traj, device,
         process_noise_scale=1e-6,
         measurement_noise_scale=1e-1,
         observe_pose_only=True,
-        dataset_idx_val=9,
+        dataset_idx_val=0,
     )
     online.initialize(start.clone())
 
@@ -582,7 +582,7 @@ def phase5_streaming_parity(model_path, dataset_root, traj, device,
         process_noise_scale=1e-6,
         measurement_noise_scale=1e-1,
         observe_pose_only=True,
-        dataset_idx_val=9,
+        dataset_idx_val=0,
         jacobian_update_interval=5,
     )
 
@@ -593,7 +593,7 @@ def phase5_streaming_parity(model_path, dataset_root, traj, device,
         process_noise_scale=1e-6,
         measurement_noise_scale=1e-1,
         observe_pose_only=True,
-        dataset_idx_val=9,
+        dataset_idx_val=0,
         jacobian_update_interval=5,
         ema_alpha=1.0,
     )
