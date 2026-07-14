@@ -18,7 +18,8 @@ from utilities.misc_utils import DEFAULT_DTYPE
 
 def rollout_by_ctrls(simulator,
                      ctrls,
-                     start_state):
+                     start_state,
+                     dataset_idx=0):
     poses = []
 
     curr_state = start_state \
@@ -30,7 +31,7 @@ def rollout_by_ctrls(simulator,
     all_states, graphs, _ = simulator.run(
         curr_state=curr_state,
         ctrls=ctrls,
-        state_to_graph_kwargs={'dataset_idx': torch.tensor([[9]], dtype=torch.long, device=curr_state.device)},
+        state_to_graph_kwargs={'dataset_idx': torch.tensor([[dataset_idx]], dtype=torch.long, device=curr_state.device)},
         show_progress=True
     )
     poses.extend([s.reshape(-1, 13, 1)[:, :7].reshape(1, -1, 1) for s in all_states])
@@ -42,7 +43,8 @@ def evaluate(simulator,
              gt_data,
              ctrls,
              init_rest_lengths,
-             init_motor_speeds):
+             init_motor_speeds,
+             dataset_idx=0):
     cables = list(simulator.robot.actuated_cables.values())
     dev = cables[0]._rest_length.device
     for i, c in enumerate(cables):
@@ -70,7 +72,7 @@ def evaluate(simulator,
     start_state = torch.tensor(state_vals, dtype=DEFAULT_DTYPE).reshape(1, -1, 1).to(dev)
 
     with torch.no_grad():
-        rollout_poses = rollout_by_ctrls(simulator, ctrls, start_state)
+        rollout_poses = rollout_by_ctrls(simulator, ctrls, start_state, dataset_idx)
 
     num_steps = min(len(rollout_poses) - 1, len(gt_data) - 1)
     com_errs, swing_errs, rot_errs, pen_errs = [], [], [], []
@@ -244,7 +246,11 @@ def main():
                         help='Recompute EKF Jacobian every N steps (1=every step, 5=5x speedup)')
     parser.add_argument('--max_spectral_radius', type=float, default=1.0,
                         help='Clamp threshold for EKF Jacobian spectral radius')
-    parser.add_argument('--dataset_idx', type=int, default=9)
+    parser.add_argument('--dataset_idx', type=int, default=0,
+                        help='Dataset one-hot index. Training used 0/1/2 for '
+                             'dataset_0/1/2; unused indices 3-9 are null '
+                             'embeddings (identical, degraded rollouts). '
+                             'This eval data is dataset_0 -> idx 0.')
     parser.add_argument('--compare_raw', action='store_true', default=False,
                         help='Also run raw GNN rollout alongside EKF and print comparison '
                              '(ekf mode only; ratio≈1.0 means EKF not correcting)')
@@ -337,7 +343,8 @@ def main():
         print(f'Wrote {len(all_states) + 1} timesteps to {args.output}')
 
         errs = evaluate(
-            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
+            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds,
+            dataset_idx=args.dataset_idx
         )
 
     elif args.mode == 'ekf':
@@ -392,7 +399,8 @@ def main():
         # evaluate() reinitializes cables/motor/LSTM before running, so it is
         # safe to call after the EKF has consumed the simulator.
         raw_errs = evaluate(
-            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
+            simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds,
+            dataset_idx=args.dataset_idx
         )
         print(f'\n=== Raw GNN baseline (for comparison) ===')
         print(f'COM Error (MSE):            {raw_errs["com"]:.6f} m\u00b2')

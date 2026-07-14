@@ -233,7 +233,9 @@ def analyze_traj(pred_poses, gt_poses, gt_end_pts):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--dataset_idx', type=int, default=9)
+    parser.add_argument('--dataset_idx', type=int, default=0,
+                        help='0 is correct for dataset_0 eval data; 3-9 are '
+                             'null embeddings (see scripts/dataset_idx_sweep.py)')
     parser.add_argument('--trajs', type=str, default=None,
                         help='Comma-separated traj names (default: all traj_*)')
     parser.add_argument('--out_dir', type=str, default='logs/swing_twist_diag')
