@@ -417,6 +417,20 @@ def compute_prin_axis(quat):
     return quat_as_rot_mat(quat)[..., 2:3]
 
 
+def compute_swing_angle_btwn_quats(q1, q2):
+    """Angle between the principal (body-z) axes of two quaternions.
+
+    Symmetry-aware rotation metric for axially symmetric rods: the GNN
+    reconstructs quats via compute_quat_btwn_z_and_vec (twistless), so a
+    full-quat angle vs MuJoCo gt mixes in unobservable axial twist.  This
+    metric ignores twist entirely and is bounded to [0, pi].
+    """
+    a1 = compute_prin_axis(q1.reshape(-1, 4, 1)).squeeze(-1)
+    a2 = compute_prin_axis(q2.reshape(-1, 4, 1)).squeeze(-1)
+    cos = torch.linalg.vecdot(a1, a2, dim=1)
+    return torch.acos(torch.clamp(cos, -1.0, 1.0))
+
+
 def quat2exp(quat, eps=1e-8):
     quat = quat / quat.norm(dim=1, keepdim=True)
 

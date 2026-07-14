@@ -108,11 +108,13 @@ def _run_raw_gnn(sim, gt_data, extra_data, device):
     ctrls = torch.tensor(
         [e["controls"] for e in extra_data], dtype=DEFAULT_DTYPE
     ).T.unsqueeze(0).to(device)
-    return evaluate(
+    errs = evaluate(
         sim, gt_data, ctrls,
         extra_data[0]["rest_lengths"],
         extra_data[0]["motor_speeds"],
     )
+    # rot is the swing (principal-axis) angle — the symmetry-aware metric.
+    return errs["com"], errs["rot_swing"], errs["pen"]
 
 
 def _run_ekf(sim, gt_data, extra_data, device, **ekf_kwargs):
@@ -126,8 +128,8 @@ def _run_ekf(sim, gt_data, extra_data, device, **ekf_kwargs):
         **ekf_kwargs,
     )
     n_rods = len(sim.robot.rigid_bodies)
-    com_e, rot_e, pen_e = evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=True)
-    return frames, com_e, rot_e, pen_e
+    errs = evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=True)
+    return frames, errs["com"], errs["rot_swing"], errs["pen"]
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +513,8 @@ def phase5_missing_measurements(model_path, dataset_root, traj, device,
         state_out = online.step(z_t=z_t, u_t=extra["controls"], have_measurement=have_meas)
         frames_online.append({"state": state_out.detach()})
 
-    ekf_com, ekf_rot, _ = evaluate_from_frames(frames_online, gt_data2, n_rods, device, is_exp=True)
+    _online_errs = evaluate_from_frames(frames_online, gt_data2, n_rods, device, is_exp=True)
+    ekf_com, ekf_rot = _online_errs["com"], _online_errs["rot_swing"]
 
     _reset_sim(sim2, extra_data2, device)
     raw_com, raw_rot, _ = _run_raw_gnn(sim2, gt_data2, extra_data2, device)

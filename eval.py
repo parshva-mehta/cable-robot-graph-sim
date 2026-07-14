@@ -73,7 +73,7 @@ def evaluate(simulator,
         rollout_poses = rollout_by_ctrls(simulator, ctrls, start_state)
 
     num_steps = min(len(rollout_poses) - 1, len(gt_data) - 1)
-    com_errs, rot_errs, pen_errs = [], [], []
+    com_errs, swing_errs, rot_errs, pen_errs = [], [], [], []
     for i in range(1, num_steps + 1):
         # rollout_poses[i]: (1, 7*num_rods, 1)
         pose_tensor = rollout_poses[i]
@@ -91,6 +91,9 @@ def evaluate(simulator,
             ).reshape(1, 4).to(dev)
 
             com_mse = ((gt_pos - pred_pos) ** 2).mean()
+            swing_err = torch_quaternion.compute_swing_angle_btwn_quats(
+                gt_quat, pred_quat
+            )
             ang_err = torch_quaternion.compute_angle_btwn_quats(gt_quat, pred_quat)
 
             gt_pen = torch.clamp_max(gt_pos[:, 2], 0.0)
@@ -98,14 +101,16 @@ def evaluate(simulator,
             pen_err = torch.clamp_min(gt_pen - pred_pen, 0.0)
 
             com_errs.append(com_mse.item())
+            swing_errs.append(swing_err.mean().item())
             rot_errs.append(ang_err.mean().item())
             pen_errs.append(pen_err.mean().item())
 
-    avg_com_err = sum(com_errs) / len(com_errs)
-    avg_rot_err = sum(rot_errs) / len(rot_errs)
-    avg_pen_err = sum(pen_errs) / len(pen_errs)
-
-    return avg_com_err, avg_rot_err, avg_pen_err
+    return {
+        'com': sum(com_errs) / len(com_errs),
+        'rot_swing': sum(swing_errs) / len(swing_errs),
+        'rot_full': sum(rot_errs) / len(rot_errs),
+        'pen': sum(pen_errs) / len(pen_errs),
+    }
 
 
 def evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=False):
@@ -118,7 +123,7 @@ def evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=False):
         from linearization_exp import exp_state_to_quat_state
 
     num_steps = min(len(frames) - 1, len(gt_data) - 1)
-    com_errs, rot_errs, pen_errs = [], [], []
+    com_errs, swing_errs, rot_errs, pen_errs = [], [], [], []
     for i in range(1, num_steps + 1):
         state_t = frames[i]['state']  # (1, state_dim, 1)
         if is_exp:
@@ -137,6 +142,9 @@ def evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=False):
             ).reshape(1, 4).to(device)
 
             com_mse = ((gt_pos - pred_pos) ** 2).mean()
+            swing_err = torch_quaternion.compute_swing_angle_btwn_quats(
+                gt_quat, pred_quat
+            )
             ang_err = torch_quaternion.compute_angle_btwn_quats(gt_quat, pred_quat)
 
             gt_pen = torch.clamp_max(gt_pos[:, 2], 0.0)
@@ -144,14 +152,16 @@ def evaluate_from_frames(frames, gt_data, n_rods, device, is_exp=False):
             pen_err = torch.clamp_min(gt_pen - pred_pen, 0.0)
 
             com_errs.append(com_mse.item())
+            swing_errs.append(swing_err.mean().item())
             rot_errs.append(ang_err.mean().item())
             pen_errs.append(pen_err.mean().item())
 
-    return (
-        sum(com_errs) / len(com_errs),
-        sum(rot_errs) / len(rot_errs),
-        sum(pen_errs) / len(pen_errs),
-    )
+    return {
+        'com': sum(com_errs) / len(com_errs),
+        'rot_swing': sum(swing_errs) / len(swing_errs),
+        'rot_full': sum(rot_errs) / len(rot_errs),
+        'pen': sum(pen_errs) / len(pen_errs),
+    }
 
 
 def write_frames_to_file(frames, output_path, mode):
@@ -326,7 +336,7 @@ def main():
                 f.write(' '.join(f'{v:.8f}' for v in row) + '\n')
         print(f'Wrote {len(all_states) + 1} timesteps to {args.output}')
 
-        com_err, rot_err, pen_err = evaluate(
+        errs = evaluate(
             simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
         )
 
@@ -347,7 +357,7 @@ def main():
             log_diagnostics=args.log_kalman_diagnostics,
         )
         write_frames_to_file(frames, args.output, mode='ekf_exp')
-        com_err, rot_err, pen_err = evaluate_from_frames(
+        errs = evaluate_from_frames(
             frames, gt_data, num_rods, device, is_exp=True
         )
 
@@ -368,26 +378,29 @@ def main():
             log_diagnostics=args.log_kalman_diagnostics,
         )
         write_frames_to_file(frames, args.output, mode='ekf_exp')
-        com_err, rot_err, pen_err = evaluate_from_frames(
+        errs = evaluate_from_frames(
             frames, gt_data, num_rods, device, is_exp=True
         )
 
-    print(f'COM Error (MSE):       {com_err:.6f} m\u00b2')
-    print(f'Rotation Error (mean): {rot_err:.6f} rad')
-    print(f'Penetration Error:     {pen_err:.6f} m')
+    print(f'COM Error (MSE):            {errs["com"]:.6f} m\u00b2')
+    print(f'Rotation Error (swing):     {errs["rot_swing"]:.6f} rad')
+    print(f'Rotation Error (full-quat): {errs["rot_full"]:.6f} rad  '
+          f'[legacy; inflated by unobservable axial twist]')
+    print(f'Penetration Error:          {errs["pen"]:.6f} m')
 
     if args.compare_raw and args.mode in ('ekf', 'gtsam'):
         # evaluate() reinitializes cables/motor/LSTM before running, so it is
         # safe to call after the EKF has consumed the simulator.
-        raw_com_err, raw_rot_err, raw_pen_err = evaluate(
+        raw_errs = evaluate(
             simulator, gt_data, ctrls, init_rest_lengths, init_motor_speeds
         )
         print(f'\n=== Raw GNN baseline (for comparison) ===')
-        print(f'COM Error (MSE):       {raw_com_err:.6f} m\u00b2')
-        print(f'Rotation Error (mean): {raw_rot_err:.6f} rad')
-        print(f'Penetration Error:     {raw_pen_err:.6f} m')
-        if raw_com_err > 1e-12:
-            ratio = com_err / raw_com_err
+        print(f'COM Error (MSE):            {raw_errs["com"]:.6f} m\u00b2')
+        print(f'Rotation Error (swing):     {raw_errs["rot_swing"]:.6f} rad')
+        print(f'Rotation Error (full-quat): {raw_errs["rot_full"]:.6f} rad')
+        print(f'Penetration Error:          {raw_errs["pen"]:.6f} m')
+        if raw_errs["com"] > 1e-12:
+            ratio = errs["com"] / raw_errs["com"]
             print(f'EKF/raw COM ratio: {ratio:.3f}  '
                   f'(< 1.0 = EKF improves, \u2248 1.0 = EKF not correcting position)')
 
