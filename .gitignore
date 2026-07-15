@@ -5,3 +5,10 @@
 !README.md
 rollout_states*.txt
 *.png
+
+# OS + generated artifacts
+.DS_Store
+logs/
+gt_states.txt
+*.mcap
+jacobian_fd_convergence.txt
