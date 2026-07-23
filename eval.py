@@ -234,7 +234,7 @@ def main():
                         help='raw: pure GNN rollout; ekf: exp-map MEKF; gtsam: GTSAM-based MEKF')
     parser.add_argument('--dt', type=float, default=0.01,
                         help='Timestep used by EKF modes')
-    parser.add_argument('--process_noise', type=float, default=1e-6,
+    parser.add_argument('--process_noise', type=float, default=1e-2,
                         help='Q scale: small = trust GNN model strongly (stable)')
     parser.add_argument('--measurement_noise', type=float, default=1e-1,
                         help='R scale: large = low Kalman gain, fewer jumps')
