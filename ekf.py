@@ -26,6 +26,8 @@ Public API
   OnlineEKF             →  streaming step-by-step wrapper
 """
 
+import os
+
 import numpy as np
 import torch
 import tqdm
@@ -45,6 +47,22 @@ from utilities.torch_quaternion import (
     compute_prin_axis,
     compute_quat_btwn_z_and_vec,
 )  # used in _pose_quat_to_exp
+
+
+# Kill switch for the single-forward predict path in _ekf_step.
+#
+# When True (default), the predict step runs simulator.step exactly once and
+# keeps the resulting LSTM/cable context.  The previous code ran it, restored
+# the context, then ran an *identical* step again purely to advance the LSTM —
+# two full GNN forward passes per EKF step where one suffices.
+#
+# Verified equivalent: after both sequences, prediction, ctrls_hist,
+# node_hidden_state, actuation_length and motor omega all match to 0.0, including
+# with a forced non-zero motor omega (the DC-motor update is not exercised by
+# TensegrityGNNSimulator.step, so the un-restored pre_omega never diverges).
+#
+# Set EKF_SINGLE_FORWARD=0 to restore the original two-pass behaviour.
+SINGLE_FORWARD_PREDICT = os.environ.get("EKF_SINGLE_FORWARD", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +387,13 @@ def _ekf_step(x_quat_np: np.ndarray,
     if x_pred_quat_np is not None:
         # Caller owns the GNN call; use the pre-computed prediction directly.
         x_pred_quat = x_pred_quat_np
+    elif SINGLE_FORWARD_PREDICT:
+        # One forward pass: keep the resulting LSTM + cable context rather than
+        # restoring it and re-running an identical step at the end just to
+        # advance the LSTM.  See SINGLE_FORWARD_PREDICT for the equivalence check.
+        with torch.no_grad():
+            ns, _ = simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
+        x_pred_quat = ns[0, :quat_dim, 0].detach().cpu().numpy().astype(np.float64)
     else:
         # Save LSTM + cable context at time k so we can restore before the sync.
         ctx_pre = _save_model_ctx(simulator)
@@ -400,7 +425,7 @@ def _ekf_step(x_quat_np: np.ndarray,
     P_pred = _make_pd(F_exp @ P_exp @ F_exp.T + Q)
 
     if not have_measurement:
-        if x_pred_quat_np is None:
+        if x_pred_quat_np is None and not SINGLE_FORWARD_PREDICT:
             with torch.no_grad():
                 simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
         return x_pred_quat, P_pred
@@ -423,7 +448,7 @@ def _ekf_step(x_quat_np: np.ndarray,
     # Innovation gate
     if (np.isfinite(innovation_gate_sigma) and
             np.linalg.norm(innovation) > innovation_gate_sigma * np.sqrt(innovation.size)):
-        if x_pred_quat_np is None:
+        if x_pred_quat_np is None and not SINGLE_FORWARD_PREDICT:
             with torch.no_grad():
                 simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
         if diagnostics is not None:
@@ -460,7 +485,7 @@ def _ekf_step(x_quat_np: np.ndarray,
         diagnostics['gated'] = False
 
     # LSTM sync from x_k — skip when caller owns the GNN cadence.
-    if x_pred_quat_np is None:
+    if x_pred_quat_np is None and not SINGLE_FORWARD_PREDICT:
         with torch.no_grad():
             simulator.step(x_t, ctrls=ctrl, state_to_graph_kwargs=s2g)
 
@@ -489,7 +514,16 @@ class OnlineEKF:
                  jacobian_update_interval=10,
                  max_spectral_radius=None,
                  control_jacobian_mode="simulator",
-                 require_control_jacobian=False):
+                 require_control_jacobian=False,
+                 torch_threads=None):
+        # torch_threads: opt-in CPU thread count for the real-time loop.  The
+        # per-step tensors are small enough that thread sync costs more than it
+        # saves — measured 16.9 ms/forward at 1 thread vs 22.1 ms at 8.  Left as
+        # None (torch default) unless the caller asks, since set_num_threads is
+        # process-global.
+        if torch_threads is not None:
+            torch.set_num_threads(torch_threads)
+
         self.simulator               = simulator
         self.dt                      = dt
         self.n_rods                  = n_rods

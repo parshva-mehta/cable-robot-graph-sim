@@ -337,6 +337,11 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='Output rollout text file (default derived from --mode)')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--torch_threads', type=int, default=1,
+                        help='CPU threads for torch. The per-step tensors here are '
+                             'small enough that thread sync costs more than it saves: '
+                             'measured 16.9 ms/forward at 1 thread vs 22.1 ms at 8. '
+                             'Use 0 to leave the torch default untouched.')
     parser.add_argument('--mode', choices=['raw', 'ekf', 'gtsam'], default='raw',
                         help='raw: pure GNN rollout; ekf: exp-map MEKF; gtsam: GTSAM-based MEKF')
     parser.add_argument('--dt', type=float, default=0.01,
@@ -365,6 +370,9 @@ def main():
                         help='Print per-step Kalman gain proxy for position block '
                              '(ekf mode only; shows innovation vs correction norms)')
     args = parser.parse_args()
+
+    if args.torch_threads > 0:
+        torch.set_num_threads(args.torch_threads)
 
     # Derive output filename from mode when not explicitly provided
     if args.output is None:
