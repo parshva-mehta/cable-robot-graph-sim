@@ -5,6 +5,7 @@ import tqdm
 
 from robots.tensegrity import TensegrityRobot
 from state_objects.base_state_object import BaseStateObject
+from utilities.tensor_utils import move_stray_tensors
 
 
 class AbstractSimulator(BaseStateObject):
@@ -77,6 +78,12 @@ class LearnedSimulator(AbstractSimulator):
         self.dt = self.dt.to(device)
         self._encode_process_decode = self._encode_process_decode.to(device)
         self.data_processor = self.data_processor.to(device)
+
+        # Catch tensor attributes the explicit to() chain above misses (robot
+        # pose state, cached masks, ctrls_hist / node_hidden_state, message-passing
+        # scratch buffers).  Required for MPS, which errors on a mixed-device op
+        # rather than silently copying.  See move_stray_tensors.
+        move_stray_tensors(self, device)
 
         return self
 

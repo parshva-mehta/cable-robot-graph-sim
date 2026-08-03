@@ -389,6 +389,11 @@ def main():
 
     if args.device.startswith('cuda') and torch.cuda.is_available():
         device = torch.device(args.device)
+    elif args.device == 'mps' and torch.backends.mps.is_available():
+        # Note: measured ~4x SLOWER than CPU for this model (58.9 ms vs 14.1 ms
+        # per forward). The GEMMs are too small to fill the GPU, so per-kernel
+        # dispatch dominates. Selectable, but CPU is the faster choice on Apple.
+        device = torch.device('mps')
     else:
         device = torch.device('cpu')
         if args.device != 'cpu':
