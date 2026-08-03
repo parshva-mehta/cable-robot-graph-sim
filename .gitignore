@@ -11,4 +11,4 @@ rollout_states*.txt
 logs/
 gt_states.txt
 *.mcap
-jacobian_fd_convergence.txt
+jacobian_fd_convergence.txt__pycache__/
