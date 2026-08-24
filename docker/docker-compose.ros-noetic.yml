@@ -1,0 +1,66 @@
+# ROS Noetic + rosbridge for consuming EKF state published by
+# sim_data_publisher.py. See docs/ekf_ros_integration_design.md.
+#
+# The image is defined by the Dockerfile in the companion catkin workspace
+# (https://github.com/parshva-mehta/catkin_ws), which already installs
+# ros-noetic-rosbridge-server and ros-noetic-foxglove-bridge and whose CMD
+# (/usr/local/bin/start_bridges.sh) starts roscore + rosbridge (9090) +
+# foxglove_bridge (8765). This compose file only wraps that image's documented
+# `docker run` invocation, so it deliberately does not override the command.
+#
+# NOTE: the catkin_ws image compiles GTSAM 4.2.0 from source and pulls CPU
+# LibTorch, so `--build` takes a long time. For the LIVE EKF -> Odometry path
+# you do NOT need that image at all -- `nav_msgs/Odometry` is a stock ROS
+# message. A plain `ros:noetic-ros-base` with `ros-noetic-rosbridge-server`
+# apt-installed is enough (see TESTING.md, Level 3, and this repo's verified
+# run). Use this compose file only when you also want the catkin workspace's
+# TensegrityBars visualization / foxglove bridge.
+#
+# Point CATKIN_WS at your catkin_ws checkout; it is mounted at /ws, matching the
+# workspace path baked into the image (ENV CATKIN_WS=/ws).
+#
+#   # build the image from the catkin_ws checkout, then run
+#   CATKIN_WS=../catkin_ws docker compose \
+#     -f docker/docker-compose.ros-noetic.yml up --build
+#
+#   # or run an image you already built as `tensegrity:noetic`
+#   CATKIN_WS=../catkin_ws docker compose \
+#     -f docker/docker-compose.ros-noetic.yml up --no-build
+#
+# Then, from this repo's Python env (no ROS needed):
+#   export ROSBRIDGE_URL=ws://localhost:9090
+#   python3 scripts/e2e_check.py --ros
+#
+# Verify messages are arriving:
+#   docker compose -f docker/docker-compose.ros-noetic.yml exec ros-noetic \
+#     bash -lc 'rostopic echo /tensegrity/rod_01/odom'
+
+services:
+  ros-noetic:
+    # Matches the tag used in the catkin workspace's instruction.md.
+    image: ${ROS_IMAGE:-tensegrity:noetic}
+    build:
+      context: ${CATKIN_WS:-../catkin_ws}
+      dockerfile: ${CATKIN_WS_DOCKERFILE:-Dockerfile}
+    # The image is amd64-only (GTSAM + LibTorch CPU wheels); required on Apple
+    # Silicon, harmless elsewhere.
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    container_name: tensegrity-ros-noetic
+    # The catkin workspace is mounted, not copied: the Dockerfile creates an
+    # empty /ws/src and expects the sources at runtime.
+    volumes:
+      - ${CATKIN_WS:-../catkin_ws}:/ws
+    ports:
+      # rosbridge websocket. A publisher on the host uses ws://localhost:9090;
+      # a sibling container uses ws://ros-noetic:9090 on this network.
+      - "${ROSBRIDGE_PORT:-9090}:9090"
+      # foxglove_bridge, also started by start_bridges.sh.
+      - "${FOXGLOVE_PORT:-8765}:8765"
+    stdin_open: true
+    tty: true
+    networks:
+      - tensegrity
+
+networks:
+  tensegrity:
+    driver: bridge
