@@ -320,10 +320,17 @@ class OnlineEKF:
                  Q_quat_inflation=2.0, Q_vel_inflation=2.0,
                  control_jacobian_mode="identity",
                  require_control_jacobian=False,
-                 dataset_idx_val=9):
+                 dataset_idx_val=9,
+                 publisher=None):
         self.simulator = simulator
         self.dt = dt
         self.n_rods = n_rods
+        # Optional live state sink, duck-typed as ``publish_state(time, state)``
+        # (e.g. sim_data_publisher.RodStatePublisher). Published once from
+        # ``initialize`` (t=0) and once per ``step``. When None, behavior is
+        # unchanged. ``_pub_time`` accumulates simulated time across steps.
+        self.publisher = publisher
+        self._pub_time = 0.0
         self.state_dim = 13 * n_rods
         self.process_noise_scale = process_noise_scale
         self.measurement_noise_scale = measurement_noise_scale
@@ -386,6 +393,10 @@ class OnlineEKF:
         self.state_gtsam = self.kf.init(x0_np, P0_np)
         self.state_torch = start_state.clone()
 
+        self._pub_time = 0.0
+        if self.publisher is not None:
+            self.publisher.publish_state(self._pub_time, self.state_torch)
+
     def step(self, z_t: np.ndarray = None, u_t=None,
              have_measurement=True) -> torch.Tensor:
         """Run one EKF predict+update step.
@@ -421,6 +432,11 @@ class OnlineEKF:
         self.state_torch = torch.tensor(
             mean_np, dtype=dtype, device=device
         ).view(1, self.state_dim, 1)
+
+        self._pub_time += self.dt
+        if self.publisher is not None:
+            self.publisher.publish_state(self._pub_time, self.state_torch)
+
         return self.state_torch
 
 
@@ -441,7 +457,8 @@ def run_ekf_rollout(simulator,
                     Q_vel_inflation=2.0,
                     innovation_gate_sigma=np.inf,
                     control_jacobian_mode="simulator",
-                    dataset_idx_val=9):
+                    dataset_idx_val=9,
+                    publisher=None):
     """Run an EKF rollout over ground-truth data with predict/update steps.
 
     Initializes from start_state or from gt_data[0] (pos, quat, linvel, angvel).
@@ -467,6 +484,14 @@ def run_ekf_rollout(simulator,
         control_jacobian_mode: "identity" or "simulator".
         dataset_idx_val: Integer dataset index for the graph processor
             (matches the value used in eval.py; default 9).
+        publisher: Optional live state sink, called as
+            ``publisher.publish_state(time, state)`` once for the initial state
+            and once per timestep, where ``state`` is the frame's
+            ``(1, state_dim, 1)`` tensor. Pass a
+            ``sim_data_publisher.RodStatePublisher`` (or ``CompositeSink``) to
+            stream estimates to ROS. When ``None`` (the default) behavior is
+            unchanged, so existing offline callers such as ``eval.py`` are
+            unaffected.
 
     Returns:
         frames: List of dicts with keys 'time', 'pose', 'state'.
@@ -543,6 +568,8 @@ def run_ekf_rollout(simulator,
     pose = state_for_frame.reshape(-1, 13, 1)[:, :7].flatten()
     frames.append({"time": time, "pose": pose,
                    "state": state_for_frame.detach().clone()})
+    if publisher is not None:
+        publisher.publish_state(time, state_for_frame)
 
     with torch.no_grad():
         for k, extra in enumerate(tqdm.tqdm(extra_gt_data)):
@@ -581,5 +608,7 @@ def run_ekf_rollout(simulator,
             pose = state_for_frame.reshape(-1, 13, 1)[:, :7].flatten()
             frames.append({"time": time, "pose": pose,
                            "state": state_for_frame.detach().clone()})
+            if publisher is not None:
+                publisher.publish_state(time, state_for_frame)
 
     return frames
