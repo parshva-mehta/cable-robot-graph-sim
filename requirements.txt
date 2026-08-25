@@ -7,6 +7,9 @@ opencv-python
 Pillow
 torch
 tqdm
+# Live EKF -> ROS bridge (sim_data_publisher.RodStatePublisher). Pure-Python
+# rosbridge websocket client -- no rospy/catkin, no ROS install needed here.
+roslibpy>=1.5
 # GTSAM (eval.py --mode ekf / ekf_exp): PyPI has no Windows wheels; use conda:
 #   conda install -c conda-forge gtsam
 # Linux/macOS may use: pip install gtsam
