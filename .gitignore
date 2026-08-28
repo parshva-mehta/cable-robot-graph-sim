@@ -1,3 +1,23 @@
+# IDEs / editors
 .idea/
+
+# Media
 *.mp4
+
+# Python bytecode / caches
 *.pyc
+__pycache__/
+
+# --- Generated artifacts (regenerate from code; not version-controlled) ---
+
+# Rollout state dumps written by eval.py
+/rollout_states.txt
+/rollout_states_ekf.txt
+/rollout_states_ekf_exp.txt
+
+# Diagnostics outputs written by diagnostics/diag_*.py
+# (the diag_*.py scripts themselves are source and remain tracked)
+diagnostics/jacobians/
+diagnostics/jacobians_exp/
+diagnostics/quaternions/
+diagnostics/exp_vs_quat/
