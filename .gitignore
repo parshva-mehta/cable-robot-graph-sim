@@ -8,12 +8,20 @@
 *.pyc
 __pycache__/
 
+# Local virtualenvs
+.venv/
+venv/
+
 # --- Generated artifacts (regenerate from code; not version-controlled) ---
 
 # Rollout state dumps written by eval.py
 /rollout_states.txt
 /rollout_states_ekf.txt
 /rollout_states_ekf_exp.txt
+
+# Rollout files written by scripts/e2e_check.py / run_all.sh
+/rollout_ekf.txt
+/rollout_ekf_online.txt
 
 # Diagnostics outputs written by diagnostics/diag_*.py
 # (the diag_*.py scripts themselves are source and remain tracked)
