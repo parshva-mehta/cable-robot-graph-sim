@@ -47,7 +47,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ekf import OnlineEKF, run_ekf_rollout
 from sim_data_publisher import (STATE_DIM_PER_ROD, DEFAULT_POSITION_SCALE,
                                 CompositeSink, RodStatePublisher,
-                                RolloutStateFileWriter, rod_names_from_simulator)
+                                RolloutStateFileWriter, rod_names_from_simulator,
+                                build_odometry_msg, split_rod_states,
+                                split_rod_covariances)
 
 DEFAULT_CONFIG = "simulators/configs/3_bar_gnn_sim_config.json"
 
@@ -260,20 +262,40 @@ class _FanOut:
     def __init__(self, file_writer, live_pub=None):
         self.sinks = [s for s in (file_writer, live_pub) if s is not None]
 
-    def publish_state(self, time, state):
-        return [s.publish_state(time, state) for s in self.sinks]
+    def publish_state(self, time, state, covariance=None):
+        out = []
+        for s in self.sinks:
+            try:
+                out.append(s.publish_state(time, state, covariance=covariance))
+            except TypeError:
+                out.append(s.publish_state(time, state))
+        return out
 
 
 class _CountingSink:
-    """Wraps a sink and counts publish_state calls, to prove every frame fired."""
+    """Wraps a sink and counts publish_state calls, to prove every frame fired.
+
+    Also records the last (state, covariance) seen so the caller can verify the
+    EKF covariance reached the sink and projects into a non-zero Odometry
+    covariance."""
 
     def __init__(self, inner):
         self.inner = inner
         self.count = 0
+        self.cov_frames = 0
+        self.last_state = None
+        self.last_cov = None
 
-    def publish_state(self, time, state):
+    def publish_state(self, time, state, covariance=None):
         self.count += 1
-        return self.inner.publish_state(time, state)
+        if covariance is not None:
+            self.cov_frames += 1
+            self.last_state = state
+            self.last_cov = covariance
+        try:
+            return self.inner.publish_state(time, state, covariance=covariance)
+        except TypeError:
+            return self.inner.publish_state(time, state)
 
     def open(self):
         opener = getattr(self.inner, "open", None) or getattr(self.inner, "connect", None)
@@ -339,6 +361,35 @@ def main():
     use_fd = not args.gnn_jacobian
     ok = True
 
+    def report_covariance(counting, n_frames):
+        """Verify the EKF covariance reached the sink and projects to a non-zero
+        6x6 Odometry covariance for each rod."""
+        nonlocal ok
+        print(f"  covariance      : {counting.cov_frames}/{n_frames} frames "
+              f"carried a covariance")
+        if counting.cov_frames != n_frames:
+            print("  FAIL: covariance missing on some frames"); ok = False
+            return
+        cov = np.asarray(counting.last_cov)
+        if cov.shape != (n_rods * STATE_DIM_PER_ROD, n_rods * STATE_DIM_PER_ROD):
+            print(f"  FAIL: covariance shape {cov.shape}"); ok = False
+            return
+        rods = split_rod_states(counting.last_state)
+        blocks = split_rod_covariances(cov, n_rods)
+        for name, (pos, quat, lv, av), P in zip(rod_names, rods, blocks):
+            msg = build_odometry_msg(name, 0.0, pos, quat, lv, av,
+                                     twist_frame="body",
+                                     position_scale=DEFAULT_POSITION_SCALE,
+                                     rod_covariance=P)
+            pose_diag = np.asarray(msg["pose"]["covariance"]).reshape(6, 6).diagonal()
+            twist_diag = np.asarray(msg["twist"]["covariance"]).reshape(6, 6).diagonal()
+            print(f"    {name}: pose-cov diag={np.array2string(pose_diag, precision=3)}"
+                  f"  twist-cov diag={np.array2string(twist_diag, precision=3)}")
+            if not np.all(np.isfinite(pose_diag)) or not np.all(np.isfinite(twist_diag)):
+                print(f"  FAIL: {name} covariance not finite"); ok = False
+            if float(np.max(pose_diag)) <= 0.0:
+                print(f"  FAIL: {name} pose covariance is all zero"); ok = False
+
     # ONE shared live publisher, connected once. roslibpy runs a Twisted reactor
     # that cannot be restarted within a process, so a second RodStatePublisher
     # (a second connect after the first terminated) would fail with
@@ -362,6 +413,7 @@ def main():
         if counting.count != len(frames):
             print("  FAIL: sink did not fire on every frame"); ok = False
         ok = check_file(args.out, len(frames), n_rods, DEFAULT_POSITION_SCALE) and ok
+        report_covariance(counting, len(frames))
         norm = np.linalg.norm(frames[-1]["state"].flatten().tolist()[3:7])
         print(f"  quat norm       : {norm:.6f}")
         if abs(norm - 1.0) > 1e-4:
@@ -388,6 +440,7 @@ def main():
             print("  FAIL: OnlineEKF sink did not fire on every frame"); ok = False
         ok = check_file(args.out_online, n_online_frames, n_rods,
                         DEFAULT_POSITION_SCALE) and ok
+        report_covariance(online_counting, n_online_frames)
     finally:
         if live_pub is not None:
             live_pub.close()
