@@ -53,6 +53,40 @@ def _reinit_state_jitter(kf, state, state_dim, jitter=1e-8):
     return kf.init(mean_col, P_sym)
 
 
+def _safe_covariance(state_gtsam, state_dim):
+    """Return the GTSAM state's (state_dim, state_dim) covariance, or None.
+
+    ``gtsam`` can raise when the covariance is unavailable, so callers that only
+    want it for publishing must not fail the filter step. Returns None when the
+    covariance is missing, the wrong shape, or non-finite.
+    """
+    if state_gtsam is None:
+        return None
+    try:
+        P = np.asarray(state_gtsam.covariance(), dtype=np.float64)
+    except Exception:  # noqa: BLE001 - covariance is best-effort for publishing
+        return None
+    if P.shape != (state_dim, state_dim) or not np.all(np.isfinite(P)):
+        return None
+    return P
+
+
+def _publish_state(publisher, time, state, covariance=None):
+    """Call ``publisher.publish_state`` with covariance, tolerating older sinks.
+
+    The publisher sink is duck-typed. In-repo sinks accept the ``covariance``
+    keyword, but a third-party sink written against the original
+    ``publish_state(time, state)`` signature must keep working -- so fall back to
+    the two-argument call if the keyword is rejected.
+    """
+    if publisher is None:
+        return
+    try:
+        publisher.publish_state(time, state, covariance=covariance)
+    except TypeError:
+        publisher.publish_state(time, state)
+
+
 # ---------------------------------------------------------------------------
 # Control helpers
 # ---------------------------------------------------------------------------
@@ -394,8 +428,8 @@ class OnlineEKF:
         self.state_torch = start_state.clone()
 
         self._pub_time = 0.0
-        if self.publisher is not None:
-            self.publisher.publish_state(self._pub_time, self.state_torch)
+        _publish_state(self.publisher, self._pub_time, self.state_torch,
+                       _safe_covariance(self.state_gtsam, self.state_dim))
 
     def step(self, z_t: np.ndarray = None, u_t=None,
              have_measurement=True) -> torch.Tensor:
@@ -434,8 +468,8 @@ class OnlineEKF:
         ).view(1, self.state_dim, 1)
 
         self._pub_time += self.dt
-        if self.publisher is not None:
-            self.publisher.publish_state(self._pub_time, self.state_torch)
+        _publish_state(self.publisher, self._pub_time, self.state_torch,
+                       _safe_covariance(self.state_gtsam, self.state_dim))
 
         return self.state_torch
 
@@ -568,8 +602,8 @@ def run_ekf_rollout(simulator,
     pose = state_for_frame.reshape(-1, 13, 1)[:, :7].flatten()
     frames.append({"time": time, "pose": pose,
                    "state": state_for_frame.detach().clone()})
-    if publisher is not None:
-        publisher.publish_state(time, state_for_frame)
+    _publish_state(publisher, time, state_for_frame,
+                   _safe_covariance(state_gtsam, state_dim))
 
     with torch.no_grad():
         for k, extra in enumerate(tqdm.tqdm(extra_gt_data)):
@@ -608,7 +642,7 @@ def run_ekf_rollout(simulator,
             pose = state_for_frame.reshape(-1, 13, 1)[:, :7].flatten()
             frames.append({"time": time, "pose": pose,
                            "state": state_for_frame.detach().clone()})
-            if publisher is not None:
-                publisher.publish_state(time, state_for_frame)
+            _publish_state(publisher, time, state_for_frame,
+                           _safe_covariance(state_gtsam, state_dim))
 
     return frames

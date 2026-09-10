@@ -35,7 +35,10 @@ CONFIG = str(_REPO / "simulators" / "configs" / "3_bar_gnn_sim_config.json")
 
 
 class RecordingSink:
-    """Duck-typed publish_state sink that records every (time, flat_state)."""
+    """Duck-typed publish_state sink that records every (time, flat_state).
+
+    Uses the original two-argument signature on purpose, so the EKF's
+    ``_publish_state`` fallback (kwarg -> positional) stays covered."""
 
     def __init__(self):
         self.calls = []
@@ -44,6 +47,16 @@ class RecordingSink:
         flat = state.detach().cpu().numpy().reshape(-1) if hasattr(state, "detach") \
             else np.asarray(state).reshape(-1)
         self.calls.append((time, flat))
+
+
+class CovRecordingSink:
+    """publish_state sink that also records the covariance the EKF passes."""
+
+    def __init__(self):
+        self.covs = []
+
+    def publish_state(self, time, state, covariance=None):
+        self.covs.append(covariance)
 
 
 @pytest.fixture
@@ -86,6 +99,18 @@ def test_run_ekf_rollout_publishes_every_frame(sim):
     assert sink.calls[-1][0] == pytest.approx(n_steps * 0.01)
     # Each published state is 39-dim (3 rods x 13).
     assert all(c[1].size == 39 for c in sink.calls)
+
+
+def test_run_ekf_rollout_passes_covariance(sim):
+    gt, extra = synthetic_data(CONFIG, sim, 3)
+    sink = CovRecordingSink()
+    run_ekf_rollout(sim, gt, extra, dt=0.01, use_finite_diff=True, publisher=sink)
+    # A covariance is recorded for every frame; whenever present it is the full
+    # 39x39 (3 rods x 13) EKF covariance.
+    assert len(sink.covs) == 4
+    present = [c for c in sink.covs if c is not None]
+    assert present, "expected at least one non-None covariance"
+    assert all(np.asarray(c).shape == (39, 39) for c in present)
 
 
 def test_run_ekf_rollout_unchanged_when_publisher_none(sim):
@@ -133,6 +158,24 @@ def test_online_ekf_publishes_every_frame(sim):
     assert len(sink.calls) == n_steps + 1
     assert sink.calls[-1][0] == pytest.approx(n_steps * 0.01)
     assert all(c[1].size == 39 for c in sink.calls)
+
+
+def test_online_ekf_passes_covariance(sim):
+    gt, extra = synthetic_data(CONFIG, sim, 3)
+    n_rods = len(sim.robot.rods)
+    sink = CovRecordingSink()
+    ekf = OnlineEKF(sim, dt=0.01, n_rods=n_rods, use_finite_diff=True,
+                    publisher=sink)
+    ekf.initialize(_start_state(gt[0], n_rods),
+                   rest_lengths=extra[0]["rest_lengths"],
+                   motor_speeds=extra[0]["motor_speeds"])
+    for k, ex in enumerate(extra):
+        have_meas = k + 1 < len(gt)
+        z = _z(gt[k + 1], n_rods) if have_meas else None
+        ekf.step(z_t=z, u_t=ex["controls"], have_measurement=have_meas)
+    present = [c for c in sink.covs if c is not None]
+    assert present, "expected at least one non-None covariance"
+    assert all(np.asarray(c).shape == (39, 39) for c in present)
 
 
 def test_online_ekf_unchanged_when_publisher_none(sim):

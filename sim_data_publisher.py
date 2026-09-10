@@ -179,6 +179,152 @@ def rotate_world_to_body(quat, vec):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Covariance projection: EKF 13-per-rod covariance -> ROS 6x6 pose / twist
+#
+# nav_msgs/Odometry carries a 6x6 pose covariance ordered
+# [x, y, z, rot_x, rot_y, rot_z] and a 6x6 twist covariance ordered
+# [vx, vy, vz, wx, wy, wz], each row-major flattened to 36 floats. The EKF's
+# covariance is 13-per-rod over [pos(3), quat(4), linvel(3), angvel(3)], so the
+# 4D quaternion block must be reduced to the 3D small-angle (so(3)) tangent that
+# ROS expects. This is the projection the v1 bridge left zeroed (see the design
+# doc's "Covariance mismatch" note); it is reproduced here in pure numpy so the
+# module stays importable without torch (linearization.py, which owns the same
+# E-matrix, pulls in torch).
+# ---------------------------------------------------------------------------
+
+def _quat_tangent_basis(quat):
+    """Return the 4x3 right-perturbation tangent basis ``E`` for a unit
+    quaternion ``(w, x, y, z)``.
+
+    Matches ``linearization._build_quat_E_matrix`` (columns orthonormal,
+    ``E.T @ E == I_3``, ``E.T @ q == 0``). A body-frame small angle ``dtheta``
+    perturbs the quaternion as ``dq = 0.5 * E @ dtheta``, so the inverse map used
+    to reduce a quaternion covariance to a small-angle covariance is
+    ``dtheta = 2 * E.T @ dq``.
+    """
+    import numpy as np
+    w, x, y, z = _as_floats(quat, 4, "quat")
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n == 0.0:
+        raise ValueError("cannot build a tangent basis for a zero quaternion")
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [-x, -y, -z],
+        [ w, -z,  y],
+        [ z,  w, -x],
+        [-y,  x,  w],
+    ], dtype=float)
+
+
+def _rotation_matrix_wxyz(quat):
+    """Return the 3x3 rotation ``R(q)`` (world <- body) for a ``(w, x, y, z)``
+    quaternion. ``rotate_world_to_body`` applies ``R.T`` to a vector using these
+    same entries, so the two stay consistent."""
+    import numpy as np
+    w, x, y, z = _as_floats(quat, 4, "quat")
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n == 0.0:
+        raise ValueError("cannot build a rotation for a zero quaternion")
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [2 * (w * w + x * x) - 1, 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     2 * (w * w + y * y) - 1, 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     2 * (w * w + z * z) - 1],
+    ], dtype=float)
+
+
+def rod_covariance_to_ros(rod_cov, quat, position_scale=DEFAULT_POSITION_SCALE,
+                          twist_frame="body"):
+    """Project one rod's 13x13 EKF covariance to ROS ``(pose_cov, twist_cov)``.
+
+    Args:
+        rod_cov: 13x13 covariance over ``[pos(3), quat(4), linvel(3), angvel(3)]``
+            (any shape numpy can reshape to 13x13), in world frame.
+        quat: The rod's orientation as repo-order ``(w, x, y, z)`` -- the
+            linearization point for the quaternion -> small-angle reduction.
+        position_scale: Simulator-units-to-meters factor. Length dimensions
+            (position, linear velocity) scale by ``s`` (variances by ``s**2``);
+            angles and angular rates are scale-invariant. Matches the mean's
+            scaling in ``build_odometry_msg``.
+        twist_frame: ``"body"`` (default, ROS convention) rotates both the twist
+            covariance and the orientation covariance into the body frame;
+            ``"world"`` leaves them in the world frame (paired with
+            ``twist_frame="world"`` on the mean).
+
+    Returns:
+        ``(pose_cov, twist_cov)`` -- two row-major flattened 6x6 lists (36 floats
+        each). Pose is ordered ``[x, y, z, rot_x, rot_y, rot_z]``; twist
+        ``[vx, vy, vz, wx, wy, wz]``. The orientation block is the 3D small-angle
+        (so(3)) covariance ``4 * E.T @ Cov(q) @ E``.
+    """
+    if twist_frame not in ("body", "world"):
+        raise ValueError(f"twist_frame must be 'body' or 'world', got {twist_frame!r}")
+
+    import numpy as np
+    P = np.asarray(rod_cov, dtype=float).reshape(
+        STATE_DIM_PER_ROD, STATE_DIM_PER_ROD
+    )
+    E = _quat_tangent_basis(quat)      # (4, 3)
+    R = _rotation_matrix_wxyz(quat)    # (3, 3) world <- body
+    s = float(position_scale)
+
+    PP = P[0:3, 0:3]        # pos-pos
+    Pq = P[0:3, 3:7]        # pos-quat (3x4)
+    QQ = P[3:7, 3:7]        # quat-quat (4x4)
+    TT = P[7:13, 7:13]      # twist (linvel+angvel), world frame (6x6)
+
+    # Quaternion covariance -> body-frame small-angle covariance.
+    pos_theta = 2.0 * (Pq @ E)             # (3x3), body
+    theta_theta = 4.0 * (E.T @ QQ @ E)     # (3x3), body
+
+    if twist_frame == "body":
+        M = np.zeros((6, 6))
+        M[0:3, 0:3] = R.T
+        M[3:6, 3:6] = R.T
+        twist6 = M @ TT @ M.T
+        # pos_theta / theta_theta are already body-frame (right perturbation).
+    else:  # "world": rotate the body-frame orientation covariance out to world.
+        theta_theta = R @ theta_theta @ R.T
+        pos_theta = pos_theta @ R.T
+        twist6 = TT.copy()
+
+    pose6 = np.zeros((6, 6))
+    pose6[0:3, 0:3] = PP
+    pose6[0:3, 3:6] = pos_theta
+    pose6[3:6, 0:3] = pos_theta.T
+    pose6[3:6, 3:6] = theta_theta
+
+    # Scale length dimensions to meters (rotations/rates are scale-invariant).
+    pose6[0:3, 0:3] *= s * s
+    pose6[0:3, 3:6] *= s
+    pose6[3:6, 0:3] *= s
+
+    twist6 = twist6.copy()
+    twist6[0:3, 0:3] *= s * s
+    twist6[0:3, 3:6] *= s
+    twist6[3:6, 0:3] *= s
+
+    return pose6.reshape(-1).tolist(), twist6.reshape(-1).tolist()
+
+
+def split_rod_covariances(covariance, n_rods):
+    """Split a flat/2D EKF covariance into per-rod 13x13 diagonal blocks.
+
+    Cross-rod covariance is dropped -- ``nav_msgs/Odometry`` is per-body, so only
+    each rod's own 13x13 diagonal block maps onto its pose/twist covariance.
+    """
+    import numpy as np
+    C = np.asarray(covariance, dtype=float).reshape(
+        n_rods * STATE_DIM_PER_ROD, n_rods * STATE_DIM_PER_ROD
+    )
+    return [
+        C[i * STATE_DIM_PER_ROD:(i + 1) * STATE_DIM_PER_ROD,
+          i * STATE_DIM_PER_ROD:(i + 1) * STATE_DIM_PER_ROD]
+        for i in range(n_rods)
+    ]
+
+
 def ros_time_from_seconds(seconds):
     """Split float seconds into a ROS ``{secs, nsecs}`` stamp."""
     secs = int(math.floor(seconds))
@@ -191,7 +337,8 @@ def ros_time_from_seconds(seconds):
 
 def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
                        frame_id=DEFAULT_FRAME_ID, twist_frame="body",
-                       position_scale=DEFAULT_POSITION_SCALE):
+                       position_scale=DEFAULT_POSITION_SCALE,
+                       rod_covariance=None):
     """Build a ``nav_msgs/Odometry`` message dict for one rod.
 
     Args:
@@ -208,6 +355,12 @@ def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
             since it is a length per unit time, to ``linvel``. ``angvel`` is in
             rad/s and is never scaled; orientation is scale-invariant. Pass
             ``1.0`` to publish raw simulator units.
+        rod_covariance: Optional 13x13 EKF covariance for this rod (world frame).
+            When given, ``pose.covariance`` and ``twist.covariance`` are filled
+            via :func:`rod_covariance_to_ros` (quaternion reduced to a 3D
+            small-angle tangent, same scaling and ``twist_frame`` as the mean).
+            When ``None`` (the default) both covariances are left zeroed, so the
+            legacy behavior is unchanged.
 
     Returns:
         A dict matching the ``nav_msgs/Odometry`` layout rosbridge expects.
@@ -224,6 +377,15 @@ def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
         linvel = rotate_world_to_body(quat, linvel)
         angvel = rotate_world_to_body(quat, angvel)
 
+    if rod_covariance is not None:
+        pose_cov, twist_cov = rod_covariance_to_ros(
+            rod_covariance, quat, position_scale=position_scale,
+            twist_frame=twist_frame,
+        )
+    else:
+        pose_cov = list(_ZERO_COVARIANCE)
+        twist_cov = list(_ZERO_COVARIANCE)
+
     return {
         "header": {
             "stamp": ros_time_from_seconds(stamp_seconds),
@@ -235,14 +397,14 @@ def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
                 "position": _vec3(pos),
                 "orientation": quat_wxyz_to_ros(quat),
             },
-            "covariance": list(_ZERO_COVARIANCE),
+            "covariance": pose_cov,
         },
         "twist": {
             "twist": {
                 "linear": _vec3(linvel),
                 "angular": _vec3(angvel),
             },
-            "covariance": list(_ZERO_COVARIANCE),
+            "covariance": twist_cov,
         },
     }
 
@@ -345,10 +507,13 @@ class RolloutStateFileWriter:
     def lines_written(self):
         return self._lines_written
 
-    def publish_state(self, time, state):
+    def publish_state(self, time, state, covariance=None):
         """Append one timestep. `time` is accepted but unused -- the format has
-        no timestamp column."""
+        no timestamp column. `covariance` is accepted for interface parity with
+        the other sinks (the 39-column file format carries no covariance) and is
+        ignored."""
         del time  # the reader expects PosA at column 0
+        del covariance  # the 39-column file layout has no covariance columns
         if self._file is None:
             raise RuntimeError(f"{type(self).__name__} is not open; call open() first")
 
@@ -382,8 +547,17 @@ class CompositeSink:
     def __init__(self, *sinks):
         self.sinks = list(sinks)
 
-    def publish_state(self, time, state):
-        return [sink.publish_state(time, state) for sink in self.sinks]
+    def publish_state(self, time, state, covariance=None):
+        # Sinks are duck-typed. In-repo sinks accept the ``covariance`` keyword;
+        # a sink written against the original ``publish_state(time, state)``
+        # signature must keep working, so fall back to the two-argument call.
+        results = []
+        for sink in self.sinks:
+            try:
+                results.append(sink.publish_state(time, state, covariance=covariance))
+            except TypeError:
+                results.append(sink.publish_state(time, state))
+        return results
 
     def open(self):
         for sink in self.sinks:
@@ -539,8 +713,13 @@ class RodStatePublisher:
     def _stamp(self, sim_time):
         return sim_time if self.stamp_source == "sim" else _time.time()
 
-    def publish_rod_state(self, rod_name, time, pos, quat, linvel, angvel):
-        """Publish one rod's state. ``time`` is the rollout's simulated time."""
+    def publish_rod_state(self, rod_name, time, pos, quat, linvel, angvel,
+                          rod_covariance=None):
+        """Publish one rod's state. ``time`` is the rollout's simulated time.
+
+        ``rod_covariance`` is an optional 13x13 EKF covariance for this rod; when
+        given it fills the Odometry pose/twist covariances (see
+        :func:`build_odometry_msg`)."""
         msg = build_odometry_msg(
             rod_name,
             self._stamp(time),
@@ -551,17 +730,21 @@ class RodStatePublisher:
             frame_id=self.frame_id,
             twist_frame=self.twist_frame,
             position_scale=self.position_scale,
+            rod_covariance=rod_covariance,
         )
         import roslibpy
 
         self._topic(rod_name).publish(roslibpy.Message(msg))
         return msg
 
-    def publish_state(self, time, state):
+    def publish_state(self, time, state, covariance=None):
         """Publish every rod in one flat EKF state vector.
 
         This is the hook ``run_ekf_rollout`` / ``OnlineEKF`` calls once per
-        timestep.
+        timestep. ``covariance``, when given, is the full
+        ``(state_dim, state_dim)`` EKF covariance; each rod's 13x13 diagonal
+        block is projected into its Odometry pose/twist covariance. When ``None``
+        the covariances are left zeroed (legacy behavior).
         """
         rods = split_rod_states(state)
         if self.rod_names is None:
@@ -571,7 +754,146 @@ class RodStatePublisher:
                 f"have {len(self.rod_names)} rod names but state holds "
                 f"{len(rods)} rods"
             )
+        covs = (split_rod_covariances(covariance, len(rods))
+                if covariance is not None else [None] * len(rods))
         return [
-            self.publish_rod_state(name, time, pos, quat, linvel, angvel)
-            for name, (pos, quat, linvel, angvel) in zip(self.rod_names, rods)
+            self.publish_rod_state(name, time, pos, quat, linvel, angvel,
+                                   rod_covariance=cov)
+            for name, (pos, quat, linvel, angvel), cov
+            in zip(self.rod_names, rods, covs)
         ]
+
+
+FLOAT64_MULTIARRAY_MSG_TYPE = "std_msgs/Float64MultiArray"
+
+
+def build_float64_multiarray_msg(matrix, label="covariance"):
+    """Build a ``std_msgs/Float64MultiArray`` dict carrying a full 2D matrix.
+
+    ``nav_msgs/Odometry`` has no field for a raw Jacobian, and its covariance is
+    a lossy 6x6-per-rod projection of the EKF's 13-per-rod state covariance. When
+    a downstream consumer needs the exact matrix -- the full
+    ``(state_dim, state_dim)`` covariance, or (once plumbed through the publisher
+    hook) the state-transition Jacobian ``F`` -- this ships it whole on a stock
+    message, so nothing custom has to be compiled inside the Noetic image.
+
+    The ``MultiArrayLayout`` encodes the 2D shape (``rows`` then ``cols``) so a
+    subscriber can reshape ``data`` unambiguously; ``dim[0].label`` carries
+    ``label`` (e.g. ``"covariance"`` or ``"jacobian"``).
+    """
+    import numpy as np
+    M = np.asarray(matrix, dtype=float)
+    if M.ndim != 2:
+        raise ValueError(f"matrix must be 2D, got shape {M.shape}")
+    rows, cols = int(M.shape[0]), int(M.shape[1])
+    return {
+        "layout": {
+            "dim": [
+                {"label": label, "size": rows, "stride": rows * cols},
+                {"label": "cols", "size": cols, "stride": cols},
+            ],
+            "data_offset": 0,
+        },
+        "data": M.reshape(-1).tolist(),
+    }
+
+
+class MatrixStreamPublisher:
+    """Streams a full matrix per timestep as ``std_msgs/Float64MultiArray``.
+
+    A duck-typed ``publish_state(time, state, covariance=None)`` sink (so it drops
+    straight into ``run_ekf_rollout(publisher=...)`` or a :class:`CompositeSink`)
+    that publishes the whole ``covariance`` matrix on a single topic, losslessly
+    -- the complement to :class:`RodStatePublisher`, whose Odometry covariance is
+    the reduced 6x6-per-rod projection. When ``covariance`` is ``None`` for a
+    frame, nothing is published for that frame.
+
+    Like :class:`RodStatePublisher`, ``roslibpy`` is imported lazily so the class
+    is importable and unit-testable without ROS.
+
+    Args:
+        url: rosbridge websocket URL (defaults to ``ROSBRIDGE_URL`` env var, else
+            ``ws://localhost:9090``).
+        topic: Topic to advertise (default ``/tensegrity/ekf/covariance``).
+        label: ``dim[0].label`` on the message (default ``"covariance"``).
+        queue_size: Per-topic rosbridge queue size.
+        connect_timeout: Seconds to wait for the websocket handshake.
+    """
+
+    def __init__(self, url=None, topic="/tensegrity/ekf/covariance",
+                 label="covariance", queue_size=10, connect_timeout=10.0):
+        self.url = url or os.environ.get("ROSBRIDGE_URL", DEFAULT_ROSBRIDGE_URL)
+        self.topic = topic
+        self.label = label
+        self.queue_size = queue_size
+        self.connect_timeout = connect_timeout
+        self._ros = None
+        self._topic_obj = None
+
+    def connect(self):
+        """Open the rosbridge websocket and advertise the topic. Idempotent."""
+        if self._ros is not None:
+            return self
+
+        import roslibpy  # lazy: keeps this module importable without roslibpy
+
+        url = self.url
+        if "://" not in url:
+            url = "ws://" + url
+        scheme, _, hostport = url.partition("://")
+        host, _, port = hostport.partition(":")
+        ros = roslibpy.Ros(
+            host=host,
+            port=int(port) if port else 9090,
+            is_secure=(scheme == "wss"),
+        )
+        ros.run(timeout=self.connect_timeout)
+        if not ros.is_connected:
+            raise ConnectionError(f"could not connect to rosbridge at {self.url}")
+        self._ros = ros
+        self._topic_obj = roslibpy.Topic(
+            ros, self.topic, FLOAT64_MULTIARRAY_MSG_TYPE, queue_size=self.queue_size
+        )
+        self._topic_obj.advertise()
+        return self
+
+    # Alias so CompositeSink.open() (which prefers open()) starts this sink too.
+    open = connect
+
+    def close(self):
+        """Unadvertise and close the websocket. Idempotent."""
+        if self._topic_obj is not None:
+            try:
+                self._topic_obj.unadvertise()
+            except Exception:  # noqa: BLE001 - best effort during teardown
+                pass
+            self._topic_obj = None
+        if self._ros is not None:
+            try:
+                self._ros.terminate()
+            finally:
+                self._ros = None
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def publish_matrix(self, matrix):
+        """Publish one 2D matrix now."""
+        if self._topic_obj is None:
+            raise RuntimeError("not connected; call connect() first")
+        import roslibpy
+
+        msg = build_float64_multiarray_msg(matrix, label=self.label)
+        self._topic_obj.publish(roslibpy.Message(msg))
+        return msg
+
+    def publish_state(self, time, state, covariance=None):
+        """Publish this frame's ``covariance`` matrix (no-op when ``None``)."""
+        del time, state  # this sink carries the matrix, not the mean
+        if covariance is None:
+            return None
+        return self.publish_matrix(covariance)

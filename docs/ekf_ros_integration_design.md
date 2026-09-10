@@ -65,10 +65,38 @@ Field mapping, per rod, per EKF state block `state[13*r : 13*r+13]`:
 | — | `header.frame_id` | `"world"` |
 | — | `child_frame_id` | rod name |
 
-Covariance: `pose.covariance` and `twist.covariance` are left zeroed. GTSAM's
-state covariance is 13-dim per rod (quaternion included) and has no exact
-closed-form projection onto the 6×6 (3 position + 3 small-angle) ordering ROS
-expects.
+Covariance: `pose.covariance` and `twist.covariance` are now filled from the
+EKF's state covariance (they were zeroed in v1). GTSAM's state covariance is
+13-dim per rod (pos 3, quat 4, linvel 3, angvel 3); the 4-dim quaternion block
+is reduced to the 3-dim small-angle (so(3)) tangent ROS expects via
+`dtheta = 2 Eᵀ dq`, giving `Cov(theta) = 4 Eᵀ Cov(q) E`, where `E` is the same
+orthonormal right-perturbation basis used in `linearization.py`
+(`_build_quat_E_matrix`). Per rod:
+
+- `pose.covariance` (6×6, ordered `[x, y, z, rot_x, rot_y, rot_z]`) =
+  `[[Cov(pos), 2·Cov(pos,q)·E], [·ᵀ, 4·Eᵀ·Cov(q)·E]]`.
+- `twist.covariance` (6×6, ordered `[vx, vy, vz, wx, wy, wz]`) = the state's
+  `[linvel, angvel]` block.
+
+Frame and scaling match the mean: length dimensions scale by `position_scale`
+(variances by its square); angles and rates are scale-invariant, and scaling
+commutes with the world→body rotation because that rotation is orthonormal.
+With `twist_frame="body"` (default) both the twist covariance and the
+orientation covariance are rotated into the body frame; with `twist_frame="world"`
+they stay in world. Cross-rod covariance is dropped — `nav_msgs/Odometry` is
+per-body. The projection is implemented in `rod_covariance_to_ros`
+(`sim_data_publisher.py`), in pure numpy so the module still imports without
+torch. `_safe_covariance` in `ekf.py` guards the GTSAM covariance read, so a
+missing/non-finite covariance simply leaves that frame's fields zeroed rather
+than failing the filter step.
+
+For a consumer that needs the exact, un-reduced matrix — the full 39×39 state
+covariance, or the state-transition Jacobian `F` once it is plumbed through the
+publisher hook — `MatrixStreamPublisher` ships a whole 2-D matrix per frame on a
+stock `std_msgs/Float64MultiArray` topic (default `/tensegrity/ekf/covariance`),
+so nothing custom has to be compiled inside the Noetic image. It is a duck-typed
+`publish_state` sink and composes with the live Odometry publisher via
+`CompositeSink`.
 
 ## Hook points (both), with a duck-typed sink
 
@@ -174,7 +202,13 @@ the scalar and `q[:, 1:]` as the vector part. ROS `geometry_msgs/Quaternion` is
 `create_transform` also reads the file quaternion as `(w, x, y, z)`, so the file
 path needs no reorder — consistent.)
 
-### 5. Covariance — left zeroed (see above).
+### 5. Covariance — projected from the EKF state covariance (see above).
+
+Was left zeroed in v1; now filled via the quaternion→small-angle reduction
+above. The reduction is a first-order (tangent-plane) approximation of the
+orientation uncertainty, exact only in the small-angle limit — see the Jacobian
+audit in `docs/jacobian_and_rotation_notes.md` for why the ambient 4-dim
+quaternion covariance is not sent as-is.
 
 ### 6. `header.stamp` — wall-clock by default
 
