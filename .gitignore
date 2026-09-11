@@ -23,6 +23,9 @@ venv/
 /rollout_ekf.txt
 /rollout_ekf_online.txt
 
+# Proof report written by scripts/prove_covariance.py
+/covariance_proof.txt
+
 # Diagnostics outputs written by diagnostics/diag_*.py
 # (the diag_*.py scripts themselves are source and remain tracked)
 diagnostics/jacobians/
