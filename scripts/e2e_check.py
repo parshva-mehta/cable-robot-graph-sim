@@ -386,20 +386,36 @@ def main():
                 formatter={"float_kind": lambda x: f"{x: .2e}"})
             return indent + body
 
+        def vec(d, *keys):
+            return np.array([float(d[k]) for k in keys])
+
         for name, (pos, quat, lv, av), P in zip(rod_names, rods, blocks):
             msg = build_odometry_msg(name, 0.0, pos, quat, lv, av,
                                      twist_frame="body",
                                      position_scale=DEFAULT_POSITION_SCALE,
                                      rod_covariance=P)
+            # The exact means + covariances a factor-graph consumer reads off the
+            # nav_msgs/Odometry message (position scaled to meters, quaternion
+            # reordered to (x,y,z,w), twist rotated into the body frame).
+            posn = msg["pose"]["pose"]["position"]
+            orient = msg["pose"]["pose"]["orientation"]
+            lin = msg["twist"]["twist"]["linear"]
+            ang = msg["twist"]["twist"]["angular"]
             pose = np.asarray(msg["pose"]["covariance"]).reshape(6, 6)
             twist = np.asarray(msg["twist"]["covariance"]).reshape(6, 6)
-            # Full 6x6 matrices, for proof (order: [x y z rot_x rot_y rot_z] /
-            # [vx vy vz wx wy wz]).
-            print(f"    {name}  pose.covariance 6x6 "
-                  f"[x y z rot_x rot_y rot_z]:")
+
+            print(f"    {name}  (values sent over the nav_msgs/Odometry message)")
+            print(f"      pose.position    (m)     = "
+                  f"{np.array2string(vec(posn,'x','y','z'), precision=6)}")
+            print(f"      pose.orientation (xyzw)  = "
+                  f"{np.array2string(vec(orient,'x','y','z','w'), precision=6)}")
+            print(f"      twist.linear     (m/s)   = "
+                  f"{np.array2string(vec(lin,'x','y','z'), precision=6)}")
+            print(f"      twist.angular    (rad/s) = "
+                  f"{np.array2string(vec(ang,'x','y','z'), precision=6)}")
+            print(f"      pose.covariance 6x6 [x y z rot_x rot_y rot_z]:")
             print(fmt6(pose))
-            print(f"    {name}  twist.covariance 6x6 "
-                  f"[vx vy vz wx wy wz]:")
+            print(f"      twist.covariance 6x6 [vx vy vz wx wy wz]:")
             print(fmt6(twist))
             if not np.all(np.isfinite(pose)) or not np.all(np.isfinite(twist)):
                 print(f"  FAIL: {name} covariance not finite"); ok = False
