@@ -325,6 +325,69 @@ def split_rod_covariances(covariance, n_rods):
     ]
 
 
+def _rod_reduction_matrix(quat, position_scale, twist_frame):
+    """Return the 12x13 matrix mapping one rod's ambient covariance block to its
+    tangent block.
+
+    Ambient columns: ``[pos(3), quat(4), linvel(3), angvel(3)]``.
+    Tangent rows:    ``[x, y, z, rot_x, rot_y, rot_z, vx, vy, vz, wx, wy, wz]``.
+
+    The orientation rows apply ``theta = 2 E^T dq`` (quaternion -> 3D small
+    angle); length rows are scaled by ``position_scale``; with ``twist_frame ==
+    "body"`` the velocity rows and orientation rows are expressed in the body
+    frame (matching :func:`rod_covariance_to_ros`).
+    """
+    import numpy as np
+    E = _quat_tangent_basis(quat)      # (4, 3)
+    R = _rotation_matrix_wxyz(quat)    # (3, 3) world <- body
+    s = float(position_scale)
+
+    M = np.zeros((12, STATE_DIM_PER_ROD))
+    M[0:3, 0:3] = s * np.eye(3)                       # position (world, scaled)
+    rot = 2.0 * E.T                                   # (3, 4) body small-angle
+    if twist_frame == "world":
+        rot = R @ rot
+    M[3:6, 3:7] = rot                                 # orientation -> small angle
+    R_vel = R.T if twist_frame == "body" else np.eye(3)
+    M[6:9, 7:10] = s * R_vel                          # linear velocity (scaled)
+    M[9:12, 10:13] = R_vel                            # angular velocity (rad/s)
+    return M
+
+
+def state_covariance_to_tangent(covariance, state,
+                                position_scale=DEFAULT_POSITION_SCALE,
+                                twist_frame="body"):
+    """Reduce the full ambient EKF covariance to the joint tangent covariance.
+
+    The EKF covariance is ``(13*n_rods)`` square over
+    ``[pos, quat, linvel, angvel]`` per rod. A factor graph wants the minimal,
+    full-rank tangent form: this returns a ``(12*n_rods)`` square matrix with the
+    4-D quaternion block of every rod reduced to the 3-D small-angle (so(3))
+    tangent, **keeping the cross-rod off-diagonal blocks** (unlike
+    :func:`split_rod_covariances`, which drops them).
+
+    Per-rod tangent order:
+    ``[x, y, z, rot_x, rot_y, rot_z, vx, vy, vz, wx, wy, wz]`` -- matching
+    ``linearization.py``'s tangent layout. ``position_scale``/``twist_frame`` are
+    applied exactly as in the per-rod Odometry covariance so the diagonal blocks
+    of this matrix equal the pose+twist covariances published per rod (reordered
+    to pose-then-twist).
+    """
+    if twist_frame not in ("body", "world"):
+        raise ValueError(f"twist_frame must be 'body' or 'world', got {twist_frame!r}")
+    import numpy as np
+    rods = split_rod_states(state)
+    n = len(rods)
+    C = np.asarray(covariance, dtype=float).reshape(
+        n * STATE_DIM_PER_ROD, n * STATE_DIM_PER_ROD
+    )
+    M = np.zeros((n * 12, n * STATE_DIM_PER_ROD))
+    for i, (pos, quat, lv, av) in enumerate(rods):
+        M[i * 12:(i + 1) * 12, i * STATE_DIM_PER_ROD:(i + 1) * STATE_DIM_PER_ROD] = \
+            _rod_reduction_matrix(quat, position_scale, twist_frame)
+    return M @ C @ M.T
+
+
 def ros_time_from_seconds(seconds):
     """Split float seconds into a ROS ``{secs, nsecs}`` stamp."""
     secs = int(math.floor(seconds))
@@ -815,16 +878,31 @@ class MatrixStreamPublisher:
         url: rosbridge websocket URL (defaults to ``ROSBRIDGE_URL`` env var, else
             ``ws://localhost:9090``).
         topic: Topic to advertise (default ``/tensegrity/ekf/covariance``).
-        label: ``dim[0].label`` on the message (default ``"covariance"``).
+        label: ``dim[0].label`` on the message (default derived from ``form``).
+        form: ``"tangent"`` (default) publishes the minimal, full-rank
+            ``(12*n_rods)`` joint covariance a factor graph wants -- every rod's
+            quaternion block reduced to the 3D small-angle tangent, cross-rod
+            blocks kept (see :func:`state_covariance_to_tangent`); ``"ambient"``
+            publishes the raw ``(13*n_rods)`` EKF covariance unchanged.
+        position_scale, twist_frame: applied to the ``"tangent"`` reduction,
+            matching the per-rod Odometry covariance. Ignored for ``"ambient"``.
         queue_size: Per-topic rosbridge queue size.
         connect_timeout: Seconds to wait for the websocket handshake.
     """
 
     def __init__(self, url=None, topic="/tensegrity/ekf/covariance",
-                 label="covariance", queue_size=10, connect_timeout=10.0):
+                 label=None, form="tangent",
+                 position_scale=DEFAULT_POSITION_SCALE, twist_frame="body",
+                 queue_size=10, connect_timeout=10.0):
+        if form not in ("tangent", "ambient"):
+            raise ValueError(f"form must be 'tangent' or 'ambient', got {form!r}")
         self.url = url or os.environ.get("ROSBRIDGE_URL", DEFAULT_ROSBRIDGE_URL)
         self.topic = topic
-        self.label = label
+        self.form = form
+        self.position_scale = float(position_scale)
+        self.twist_frame = twist_frame
+        self.label = label if label is not None else (
+            "covariance_tangent" if form == "tangent" else "covariance")
         self.queue_size = queue_size
         self.connect_timeout = connect_timeout
         self._ros = None
@@ -892,8 +970,19 @@ class MatrixStreamPublisher:
         return msg
 
     def publish_state(self, time, state, covariance=None):
-        """Publish this frame's ``covariance`` matrix (no-op when ``None``)."""
-        del time, state  # this sink carries the matrix, not the mean
+        """Publish this frame's covariance matrix (no-op when ``None``).
+
+        With ``form="tangent"`` the ambient covariance is reduced to the joint
+        tangent covariance using ``state`` (for each rod's quaternion); with
+        ``form="ambient"`` it is published as-is.
+        """
+        del time
         if covariance is None:
             return None
-        return self.publish_matrix(covariance)
+        if self.form == "tangent":
+            matrix = state_covariance_to_tangent(
+                covariance, state,
+                position_scale=self.position_scale, twist_frame=self.twist_frame)
+        else:
+            matrix = covariance
+        return self.publish_matrix(matrix)

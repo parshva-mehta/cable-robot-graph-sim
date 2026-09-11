@@ -32,3 +32,7 @@ diagnostics/jacobians/
 diagnostics/jacobians_exp/
 diagnostics/quaternions/
 diagnostics/exp_vs_quat/
+
+# EKF covariance proof artifacts
+joint_covariance_tangent_*.txt
+covariance_proof.txt

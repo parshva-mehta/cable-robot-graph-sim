@@ -249,6 +249,80 @@ def test_split_rod_covariances_takes_diagonal_blocks():
     assert np.array_equal(blocks[2], P[26:39, 26:39])
 
 
+# -- full joint tangent covariance -------------------------------------------
+
+def _valid_state(n_rods):
+    """A state with unit quaternions so the tangent reduction is well-defined."""
+    s = []
+    for r in range(n_rods):
+        s += [0.1 * r, 0.2 * r, 0.3 * r] + IDENTITY_QUAT + [0.0] * 3 + [0.0] * 3
+    return s
+
+
+def test_state_covariance_to_tangent_shape_and_rank():
+    n = 3
+    # A positive-definite ambient covariance (identity quats -> valid tangent).
+    C = np.eye(n * 13) * 0.01
+    Ct = sdp.state_covariance_to_tangent(C, _valid_state(n), position_scale=1.0)
+    assert Ct.shape == (n * 12, n * 12)
+    assert np.allclose(Ct, Ct.T, atol=1e-12)
+    assert np.linalg.matrix_rank(Ct, tol=1e-9) == n * 12   # full rank (minimal)
+
+
+def test_tangent_diagonal_blocks_match_per_rod_odometry():
+    """Each rod's 12x12 tangent block = its Odometry pose6 (top-left) and
+    twist6 (bottom-right), so the joint matrix is consistent with what is
+    published per rod."""
+    n = 2
+    P = _rod_cov(pos_var=0.02, quat_vec_var=0.01, linvel_var=0.03,
+                 angvel_var=0.05, pos_quat=0.004)
+    C = np.zeros((n * 13, n * 13))
+    for i in range(n):
+        C[i * 13:(i + 1) * 13, i * 13:(i + 1) * 13] = P
+    state = _valid_state(n)
+    Ct = sdp.state_covariance_to_tangent(C, state, position_scale=0.3,
+                                         twist_frame="body")
+    pose6, twist6 = sdp.rod_covariance_to_ros(P, IDENTITY_QUAT,
+                                              position_scale=0.3, twist_frame="body")
+    blk = Ct[0:12, 0:12]
+    assert np.allclose(blk[0:6, 0:6], np.array(pose6).reshape(6, 6), atol=1e-12)
+    assert np.allclose(blk[6:12, 6:12], np.array(twist6).reshape(6, 6), atol=1e-12)
+
+
+def test_tangent_keeps_cross_rod_correlation():
+    """Unlike split_rod_covariances, the joint reduction preserves off-diagonal
+    (cross-rod) blocks."""
+    n = 2
+    C = np.eye(n * 13) * 0.01
+    C[0, 13] = C[13, 0] = 0.005   # rod0 x <-> rod1 x correlation
+    Ct = sdp.state_covariance_to_tangent(C, _valid_state(n), position_scale=1.0)
+    # rod0 x (tangent idx 0) vs rod1 x (tangent idx 12) must be non-zero.
+    assert abs(Ct[0, 12]) > 0
+    assert Ct[0, 12] == pytest.approx(0.005, abs=1e-12)
+
+
+def test_matrix_stream_publisher_tangent_form(fake_roslibpy):
+    C = np.eye(39) * 0.01
+    with sdp.MatrixStreamPublisher(url="ws://localhost:9090", form="tangent") as pub:
+        pub.publish_state(0.0, _valid_state(3), covariance=C)
+    msg = fake_roslibpy.topics[0].published[0]
+    assert msg["layout"]["dim"][0]["size"] == 36     # reduced to 12*3
+    assert msg["layout"]["dim"][0]["label"] == "covariance_tangent"
+
+
+def test_matrix_stream_publisher_ambient_form(fake_roslibpy):
+    C = np.eye(39) * 0.01
+    with sdp.MatrixStreamPublisher(url="ws://localhost:9090", form="ambient") as pub:
+        pub.publish_state(0.0, _valid_state(3), covariance=C)
+    msg = fake_roslibpy.topics[0].published[0]
+    assert msg["layout"]["dim"][0]["size"] == 39     # raw ambient
+
+
+def test_matrix_stream_publisher_rejects_bad_form():
+    with pytest.raises(ValueError, match="form must be"):
+        sdp.MatrixStreamPublisher(form="reduced")
+
+
 # -- build_odometry_msg with covariance --------------------------------------
 
 def test_build_odometry_msg_zeroes_covariance_by_default():
@@ -326,7 +400,7 @@ def test_build_float64_multiarray_rejects_non_2d():
 
 def test_matrix_stream_publisher_publishes_full_covariance(fake_roslibpy):
     cov = np.eye(39) * 0.7
-    with sdp.MatrixStreamPublisher(url="ws://localhost:9090") as pub:
+    with sdp.MatrixStreamPublisher(url="ws://localhost:9090", form="ambient") as pub:
         pub.publish_state(0.0, _synthetic_state(3), covariance=cov)
     topic = fake_roslibpy.topics[0]
     assert topic.name == "/tensegrity/ekf/covariance"

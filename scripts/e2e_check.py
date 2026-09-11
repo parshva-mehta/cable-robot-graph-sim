@@ -49,7 +49,8 @@ from sim_data_publisher import (STATE_DIM_PER_ROD, DEFAULT_POSITION_SCALE,
                                 CompositeSink, RodStatePublisher,
                                 RolloutStateFileWriter, rod_names_from_simulator,
                                 build_odometry_msg, split_rod_states,
-                                split_rod_covariances)
+                                split_rod_covariances, state_covariance_to_tangent,
+                                MatrixStreamPublisher)
 
 DEFAULT_CONFIG = "simulators/configs/3_bar_gnn_sim_config.json"
 
@@ -259,8 +260,8 @@ class _FanOut:
     the file writer is managed by its own ``with`` block and the live publisher
     is connected/closed once by the caller (see the reactor note in main)."""
 
-    def __init__(self, file_writer, live_pub=None):
-        self.sinks = [s for s in (file_writer, live_pub) if s is not None]
+    def __init__(self, file_writer, *live_sinks):
+        self.sinks = [s for s in (file_writer, *live_sinks) if s is not None]
 
     def publish_state(self, time, state, covariance=None):
         out = []
@@ -361,9 +362,10 @@ def main():
     use_fd = not args.gnn_jacobian
     ok = True
 
-    def report_covariance(counting, n_frames):
+    def report_covariance(counting, n_frames, tag):
         """Verify the EKF covariance reached the sink and projects to a non-zero
-        6x6 Odometry covariance for each rod."""
+        6x6 Odometry covariance for each rod, and emit the full joint tangent
+        covariance a factor graph consumes."""
         nonlocal ok
         print(f"  covariance      : {counting.cov_frames}/{n_frames} frames "
               f"carried a covariance")
@@ -422,30 +424,64 @@ def main():
             if float(np.max(pose.diagonal())) <= 0.0:
                 print(f"  FAIL: {name} pose covariance is all zero"); ok = False
 
+        # Full joint covariance (all rods, cross-rod blocks kept), reduced to the
+        # minimal tangent form a factor graph consumes.
+        Ct = state_covariance_to_tangent(cov, counting.last_state,
+                                         position_scale=DEFAULT_POSITION_SCALE,
+                                         twist_frame="body")
+        d = Ct.shape[0]
+        sym = float(np.max(np.abs(Ct - Ct.T)))
+        rank = int(np.linalg.matrix_rank(Ct, tol=1e-9))
+        min_eig = float(np.linalg.eigvalsh(0.5 * (Ct + Ct.T)).min())
+        out_path = Path(f"joint_covariance_tangent_{tag}.txt")
+        np.savetxt(out_path, Ct, fmt="%.9e")
+        print(f"    joint tangent covariance ({d}x{d}, all rods, cross-rod blocks kept):")
+        print(f"      per-rod order : [x y z rot_x rot_y rot_z vx vy vz wx wy wz]")
+        print(f"      symmetric     : max|C-C^T| = {sym:.2e}")
+        print(f"      rank          : {rank}/{d}  (full rank => minimal & non-degenerate)")
+        print(f"      min eigenvalue: {min_eig:.2e}  (>= 0 => PSD)")
+        print(f"      full matrix   : saved to {out_path}")
+        if not np.all(np.isfinite(Ct)):
+            print("  FAIL: joint tangent covariance not finite"); ok = False
+        if sym > 1e-8:
+            print("  FAIL: joint tangent covariance not symmetric"); ok = False
+
     # ONE shared live publisher, connected once. roslibpy runs a Twisted reactor
     # that cannot be restarted within a process, so a second RodStatePublisher
     # (a second connect after the first terminated) would fail with
     # ReactorNotRestartable. Both hook paths reuse this single connection and it
     # is closed once at the very end.
     live_pub = None
+    matrix_pub = None
     if args.ros:
         live_pub = RodStatePublisher(url=args.rosbridge_url,
                                      rod_names=rod_names, stamp_source="sim")
         live_pub.connect()
         print(f"  rosbridge : {live_pub.url}")
+        # Full joint covariance (36x36 tangent) on a stock Float64MultiArray topic
+        # -- the matrix a factor graph consumes. Best-effort: a second rosbridge
+        # connection may be unavailable, in which case the file/printed proof
+        # still carries the matrix.
+        try:
+            matrix_pub = MatrixStreamPublisher(url=args.rosbridge_url, form="tangent")
+            matrix_pub.connect()
+            print(f"  matrix topic : {matrix_pub.topic} (joint tangent covariance)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (full-matrix stream unavailable: {exc})")
+            matrix_pub = None
 
     try:
         # --- Path 1: run_ekf_rollout --------------------------------------
         print("\n[1/2] run_ekf_rollout ...")
         with RolloutStateFileWriter(args.out, expected_n_rods=n_rods) as fw:
-            counting = _CountingSink(_FanOut(fw, live_pub))
+            counting = _CountingSink(_FanOut(fw, live_pub, matrix_pub))
             frames = run_ekf_rollout(sim, gt, extra, args.dt,
                                      use_finite_diff=use_fd, publisher=counting)
         print(f"  sink fired {counting.count} times for {len(frames)} frames")
         if counting.count != len(frames):
             print("  FAIL: sink did not fire on every frame"); ok = False
         ok = check_file(args.out, len(frames), n_rods, DEFAULT_POSITION_SCALE) and ok
-        report_covariance(counting, len(frames))
+        report_covariance(counting, len(frames), "rollout")
         norm = np.linalg.norm(frames[-1]["state"].flatten().tolist()[3:7])
         print(f"  quat norm       : {norm:.6f}")
         if abs(norm - 1.0) > 1e-4:
@@ -455,7 +491,7 @@ def main():
         print("\n[2/2] OnlineEKF (streaming) ...")
         start_state = _build_start_state(gt[0], n_rods)
         with RolloutStateFileWriter(args.out_online, expected_n_rods=n_rods) as fw:
-            online_counting = _CountingSink(_FanOut(fw, live_pub))
+            online_counting = _CountingSink(_FanOut(fw, live_pub, matrix_pub))
             ekf = OnlineEKF(sim, dt=args.dt, n_rods=n_rods, use_finite_diff=use_fd,
                             publisher=online_counting)
             ekf.initialize(start_state,
@@ -472,8 +508,10 @@ def main():
             print("  FAIL: OnlineEKF sink did not fire on every frame"); ok = False
         ok = check_file(args.out_online, n_online_frames, n_rods,
                         DEFAULT_POSITION_SCALE) and ok
-        report_covariance(online_counting, n_online_frames)
+        report_covariance(online_counting, n_online_frames, "online")
     finally:
+        if matrix_pub is not None:
+            matrix_pub.close()
         if live_pub is not None:
             live_pub.close()
 
