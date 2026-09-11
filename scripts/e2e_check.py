@@ -376,18 +376,34 @@ def main():
             return
         rods = split_rod_states(counting.last_state)
         blocks = split_rod_covariances(cov, n_rods)
+
+        def fmt6(flat, indent="        "):
+            # Scientific notation so tiny-but-nonzero variances (e.g. 3.6e-06)
+            # stay visible instead of rounding to 0.000 -- this is proof output.
+            m = np.asarray(flat, dtype=float).reshape(6, 6)
+            body = np.array2string(
+                m, max_line_width=200, separator="  ", prefix=indent,
+                formatter={"float_kind": lambda x: f"{x: .2e}"})
+            return indent + body
+
         for name, (pos, quat, lv, av), P in zip(rod_names, rods, blocks):
             msg = build_odometry_msg(name, 0.0, pos, quat, lv, av,
                                      twist_frame="body",
                                      position_scale=DEFAULT_POSITION_SCALE,
                                      rod_covariance=P)
-            pose_diag = np.asarray(msg["pose"]["covariance"]).reshape(6, 6).diagonal()
-            twist_diag = np.asarray(msg["twist"]["covariance"]).reshape(6, 6).diagonal()
-            print(f"    {name}: pose-cov diag={np.array2string(pose_diag, precision=3)}"
-                  f"  twist-cov diag={np.array2string(twist_diag, precision=3)}")
-            if not np.all(np.isfinite(pose_diag)) or not np.all(np.isfinite(twist_diag)):
+            pose = np.asarray(msg["pose"]["covariance"]).reshape(6, 6)
+            twist = np.asarray(msg["twist"]["covariance"]).reshape(6, 6)
+            # Full 6x6 matrices, for proof (order: [x y z rot_x rot_y rot_z] /
+            # [vx vy vz wx wy wz]).
+            print(f"    {name}  pose.covariance 6x6 "
+                  f"[x y z rot_x rot_y rot_z]:")
+            print(fmt6(pose))
+            print(f"    {name}  twist.covariance 6x6 "
+                  f"[vx vy vz wx wy wz]:")
+            print(fmt6(twist))
+            if not np.all(np.isfinite(pose)) or not np.all(np.isfinite(twist)):
                 print(f"  FAIL: {name} covariance not finite"); ok = False
-            if float(np.max(pose_diag)) <= 0.0:
+            if float(np.max(pose.diagonal())) <= 0.0:
                 print(f"  FAIL: {name} pose covariance is all zero"); ok = False
 
     # ONE shared live publisher, connected once. roslibpy runs a Twisted reactor
