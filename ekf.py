@@ -41,6 +41,50 @@ def _renormalize_quats_numpy(mean: np.ndarray, n_rods: int) -> None:
             mean[13 * r + 3 : 13 * r + 7] = q / n
 
 
+def _hemisphere_align_measurement(z_np, mean_pred, n_rods):
+    """Return a copy of the measurement with each rod's quaternion sign-aligned
+    to the predicted state, resolving the quaternion double cover.
+
+    ``q`` and ``-q`` are the same rotation, so a measurement quaternion in the
+    opposite hemisphere from the prediction (``dot(q_meas, q_pred) < 0``) yields a
+    spurious ~``2*q`` innovation for an identical orientation. Flipping its sign
+    fixes that. Handles the full-state (13/rod) and pose-only (7/rod) measurement
+    layouts; the predicted quaternion is always at ``mean_pred[13*r+3 : 13*r+7]``.
+    """
+    z = np.asarray(z_np, dtype=np.float64).reshape(-1).copy()
+    meas_dim = z.size
+    if meas_dim == 13 * n_rods:
+        mstride = 13
+    elif meas_dim == 7 * n_rods:
+        mstride = 7
+    else:
+        return z  # unknown layout -- leave untouched
+    for r in range(n_rods):
+        qs = r * mstride + 3
+        zq = z[qs:qs + 4]
+        pq = mean_pred[13 * r + 3: 13 * r + 7]
+        if float(np.dot(zq, pq)) < 0.0:
+            z[qs:qs + 4] = -zq
+    return z
+
+
+def _reduce_jacobian_to_tangent(F_ambient, state_mean, n_rods):
+    """Reduce the ambient (13*n_rods square) state-transition Jacobian to the
+    minimal tangent Jacobian (12*n_rods square).
+
+    ``F_tangent = T_out @ F @ T_in`` with the orthonormal quaternion->3D tangent
+    projection (``linearization._build_tangent_projections``). Unlike a
+    covariance reduction, a Jacobian maps tangent-in to tangent-out, so the
+    small-angle factors cancel and the orthonormal ``E`` (no factor of 2, no
+    scaling) is correct. The per-rod tangent order matches
+    ``sim_data_publisher.state_covariance_to_tangent`` --
+    ``[x y z rot_x rot_y rot_z vx vy vz wx wy wz]`` -- so F and the covariance a
+    factor graph receives share one coordinate system.
+    """
+    T_out, T_in = _build_tangent_projections(state_mean, n_rods)
+    return T_out @ np.asarray(F_ambient, dtype=np.float64) @ T_in
+
+
 # ---------------------------------------------------------------------------
 # GTSAM helpers
 # ---------------------------------------------------------------------------
@@ -71,18 +115,25 @@ def _safe_covariance(state_gtsam, state_dim):
     return P
 
 
-def _publish_state(publisher, time, state, covariance=None):
-    """Call ``publisher.publish_state`` with covariance, tolerating older sinks.
+def _publish_state(publisher, time, state, covariance=None, jacobian=None):
+    """Call ``publisher.publish_state`` with covariance and Jacobian, tolerating
+    older sinks.
 
-    The publisher sink is duck-typed. In-repo sinks accept the ``covariance``
-    keyword, but a third-party sink written against the original
-    ``publish_state(time, state)`` signature must keep working -- so fall back to
-    the two-argument call if the keyword is rejected.
+    The publisher sink is duck-typed. In-repo sinks accept the ``covariance`` and
+    ``jacobian`` keywords, but a sink written against an earlier signature must
+    keep working -- so degrade gracefully: try both keywords, then covariance
+    only, then the bare two-argument call.
     """
     if publisher is None:
         return
     try:
+        publisher.publish_state(time, state, covariance=covariance, jacobian=jacobian)
+        return
+    except TypeError:
+        pass
+    try:
         publisher.publish_state(time, state, covariance=covariance)
+        return
     except TypeError:
         publisher.publish_state(time, state)
 
@@ -239,21 +290,29 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     Returns:
         mean_for_output: State mean (quats renormalized).
         state_gtsam: New GTSAM state.
+        F_tangent: Minimal (12*n_rods square) tangent state-transition Jacobian of
+            the raw model, or None when the raw Jacobian was non-finite. Published
+            for a factor-graph consumer; not used by the EKF predict itself.
     """
     state_dim = state_torch.numel()
     x_mean = np.array(state_gtsam.mean()).reshape(-1).astype(np.float64)
 
     # --- Jacobian F from linearize_dynamics (uses zero controls internally) ---
-    _, F_np = linearize_dynamics(
+    _, F_raw = linearize_dynamics(
         simulator, state_torch,
         sample_index=dataset_idx_val,
         use_finite_diff=use_finite_diff,
     )
 
-    if not np.all(np.isfinite(F_np)):
+    # F_np is the rank-fixed/clamped Jacobian the EKF predict uses; F_tangent is
+    # the minimal tangent reduction of the *raw* model Jacobian, published for a
+    # factor-graph consumer (no stability clamp/regulariser -- the true df/dx).
+    if not np.all(np.isfinite(F_raw)):
         F_np = np.eye(state_dim, dtype=np.float64)
+        F_tangent = None
     else:
-        F_np = _fix_jacobian_quaternion_rank(F_np, x_mean, n_rods)
+        F_np = _fix_jacobian_quaternion_rank(F_raw, x_mean, n_rods)
+        F_tangent = _reduce_jacobian_to_tangent(F_raw, x_mean, n_rods)
 
     # --- Nominal next state with actual controls ----------------------------
     device = state_torch.device
@@ -310,7 +369,7 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
 
     if not have_measurement:
         mean_np = np.array(state_pred.mean()).reshape(-1)
-        return mean_np, state_pred
+        return mean_np, state_pred, F_tangent
 
     mean_pred = np.array(state_pred.mean()).reshape(-1).copy()
     try:
@@ -320,12 +379,17 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     P_sym = 0.5 * (P_pred + P_pred.T) + 1e-8 * np.eye(state_dim, dtype=np.float64)
     state_pred = kf.init(mean_pred.reshape(state_dim, 1), P_sym)
 
+    # Resolve the quaternion double cover before differencing measurement and
+    # prediction, so an antipodal-but-identical orientation does not inject a
+    # spurious ~2*q innovation.
+    z_np = _hemisphere_align_measurement(z_np, mean_pred, n_rods)
+
     innovation = z_np.reshape(-1) - (H_np @ mean_pred)
     if (np.isfinite(innovation_gate_sigma) and
             np.linalg.norm(innovation) > innovation_gate_sigma * np.sqrt(innovation.size)):
         mean_for_output = mean_pred.copy()
         _renormalize_quats_numpy(mean_for_output, n_rods)
-        return mean_for_output, state_pred
+        return mean_for_output, state_pred, F_tangent
 
     meas_dim = z_np.size
     z_col = np.asarray(z_np, dtype=np.float64).reshape(meas_dim, 1)
@@ -337,7 +401,7 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     state_post = _reinit_state_jitter(kf, state_post, state_dim)
     mean_np = np.array(state_post.mean()).reshape(-1).copy()
     _renormalize_quats_numpy(mean_np, n_rods)
-    return mean_np, state_post
+    return mean_np, state_post, F_tangent
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +516,7 @@ class OnlineEKF:
 
         ctrl_step = _ensure_ctrl_for_step(u_t, self.simulator)
         with torch.no_grad():
-            mean_np, self.state_gtsam = _ekf_step_gtsam(
+            mean_np, self.state_gtsam, F_tangent = _ekf_step_gtsam(
                 self.kf, self.state_gtsam, self.simulator,
                 self.state_torch, self.dt, ctrl_step, self.H_np, z_t,
                 self.Q_sigmas, self.R_sigmas, self.n_rods,
@@ -469,7 +533,8 @@ class OnlineEKF:
 
         self._pub_time += self.dt
         _publish_state(self.publisher, self._pub_time, self.state_torch,
-                       _safe_covariance(self.state_gtsam, self.state_dim))
+                       _safe_covariance(self.state_gtsam, self.state_dim),
+                       jacobian=F_tangent)
 
         return self.state_torch
 
@@ -626,7 +691,7 @@ def run_ekf_rollout(simulator,
                     av = np.array(gt['angvel'], dtype=np.float64).reshape(-1, 3)
                     z_np = np.hstack([pos, quat, lv, av]).reshape(-1)
 
-            mean_np, state_gtsam = _ekf_step_gtsam(
+            mean_np, state_gtsam, F_tangent = _ekf_step_gtsam(
                 kf, state_gtsam, simulator, state_torch, dt, ctrl_step,
                 H_np, z_np, Q_sigmas, R_sigmas, n_rods, have_measurement,
                 use_finite_diff=use_finite_diff,
@@ -643,6 +708,7 @@ def run_ekf_rollout(simulator,
             frames.append({"time": time, "pose": pose,
                            "state": state_for_frame.detach().clone()})
             _publish_state(publisher, time, state_for_frame,
-                           _safe_covariance(state_gtsam, state_dim))
+                           _safe_covariance(state_gtsam, state_dim),
+                           jacobian=F_tangent)
 
     return frames

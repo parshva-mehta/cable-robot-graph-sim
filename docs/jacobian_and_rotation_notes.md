@@ -49,18 +49,26 @@ Then `_fix_jacobian_quaternion_rank` (`linearization.py:116`) "repairs" it:
   heuristic; after it, `F_fixed ≠ ∂f/∂x`. Sending it as "the Jacobian" would ship
   a stabilized surrogate, not the model's true sensitivity.
 
-**Recommendation.** For ROS, send *uncertainty*, not the raw ambient Jacobian —
-which is what Task C now does: the EKF covariance projected to the 6×6 small-angle
-tangent (`rod_covariance_to_ros`). If a downstream consumer genuinely needs a
-Jacobian matrix, send one of the **continuous, full-rank 36×36** forms over the
-`Float64MultiArray` channel (`MatrixStreamPublisher`):
+**Recommendation — IMPLEMENTED.** For ROS, send *uncertainty*, not the raw
+ambient Jacobian: the EKF covariance projected to the small-angle tangent
+(`rod_covariance_to_ros` per rod; `state_covariance_to_tangent` for the full
+36×36 joint matrix). When the consumer also needs the Jacobian, send the
+**continuous, full-rank 36×36 tangent** form — `T_out @ F_raw @ T_in`
+(`_reduce_jacobian_to_tangent` in `ekf.py`), reduced from the **raw** model
+Jacobian **before** the spectral clamp and `ε·qqᵀ` regulariser (those are EKF
+stability hacks, not part of `df/dx`). `_ekf_step_gtsam` returns it, the publish
+hook carries it (`jacobian=`), and `MatrixStreamPublisher(source="jacobian")`
+streams it on `/tensegrity/ekf/jacobian` as a stock `Float64MultiArray`.
 
-- the tangent Jacobian `T_out @ F @ T_in` (before the `ε·qqᵀ` hack, ideally before
-  the spectral clamp), or
-- the exp-map Jacobian from `linearization_exp.py`, which is naturally 36×36 and
-  full-rank (no projection, no `ε·qqᵀ`).
+The 36×36 Jacobian shares the covariance's per-rod tangent order
+`[x y z rot_x rot_y rot_z vx vy vz wx wy wz]`, so `F` and `Cov` are in one
+coordinate system for the factor graph. Note the reduction uses the **orthonormal**
+`E` (no factor of 2): a Jacobian maps tangent-in → tangent-out, so the small-angle
+`2` and `½` factors cancel — unlike the covariance, which carries `4 EᵀCE`.
 
-Do **not** send the 39×39 `F_fixed`.
+Do **not** send the 39×39 `F_fixed`. (The exp-map Jacobian from
+`linearization_exp.py` is an equivalent naturally-36×36 alternative if a
+quaternion-free path is ever preferred.)
 
 ---
 
@@ -85,7 +93,15 @@ rotations (that is the case Zhou et al. argue needs 6-D). We do not regress
 absolute rotations here, so 6-D is not warranted; the recommendation is scoped to
 the filter/linearization.
 
-### Concrete latent bug: double-cover in the EKF update **[unrun]**
+### Concrete bug: double-cover in the EKF update — **FIXED**
+
+> Resolved: `_hemisphere_align_measurement` in `ekf.py` now sign-aligns each
+> rod's measurement quaternion to the predicted state before the innovation is
+> formed (both full-state and pose-only layouts), in `_ekf_step_gtsam`. Tests:
+> `test_hemisphere_align_flips_antipodal_quaternion` and
+> `test_double_cover_measurement_does_not_flip_estimate`. The original analysis
+> follows.
+
 
 `run_ekf_rollout` builds the measurement `z` directly from ground-truth
 quaternions with `H = I` (`ekf.py:587-593`, `:563`) and forms the innovation as

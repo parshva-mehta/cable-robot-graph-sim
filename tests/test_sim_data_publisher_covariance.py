@@ -323,6 +323,34 @@ def test_matrix_stream_publisher_rejects_bad_form():
         sdp.MatrixStreamPublisher(form="reduced")
 
 
+def test_matrix_stream_publisher_jacobian_source_publishes_jacobian(fake_roslibpy):
+    """source='jacobian' publishes the given (already-tangent) Jacobian as-is and
+    ignores covariance."""
+    J = np.arange(36 * 36, dtype=float).reshape(36, 36)
+    C = np.eye(39)
+    with sdp.MatrixStreamPublisher(url="ws://localhost:9090", source="jacobian",
+                                   topic="/tensegrity/ekf/jacobian") as pub:
+        pub.publish_state(0.0, _valid_state(3), covariance=C, jacobian=J)
+    topic = fake_roslibpy.topics[0]
+    assert topic.name == "/tensegrity/ekf/jacobian"
+    msg = topic.published[0]
+    assert msg["layout"]["dim"][0]["label"] == "jacobian_tangent"
+    assert (msg["layout"]["dim"][0]["size"], msg["layout"]["dim"][1]["size"]) == (36, 36)
+    assert np.array(msg["data"]).reshape(36, 36)[1, 0] == pytest.approx(36.0)
+
+
+def test_matrix_stream_publisher_jacobian_noop_without_jacobian(fake_roslibpy):
+    """source='jacobian' does not publish covariance when no Jacobian is given."""
+    with sdp.MatrixStreamPublisher(url="ws://localhost:9090", source="jacobian") as pub:
+        assert pub.publish_state(0.0, _valid_state(3), covariance=np.eye(39)) is None
+    assert fake_roslibpy.topics[0].published == []
+
+
+def test_matrix_stream_publisher_rejects_bad_source():
+    with pytest.raises(ValueError, match="source must be"):
+        sdp.MatrixStreamPublisher(source="hessian")
+
+
 # -- build_odometry_msg with covariance --------------------------------------
 
 def test_build_odometry_msg_zeroes_covariance_by_default():

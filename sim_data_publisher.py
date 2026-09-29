@@ -570,13 +570,13 @@ class RolloutStateFileWriter:
     def lines_written(self):
         return self._lines_written
 
-    def publish_state(self, time, state, covariance=None):
+    def publish_state(self, time, state, covariance=None, jacobian=None):
         """Append one timestep. `time` is accepted but unused -- the format has
-        no timestamp column. `covariance` is accepted for interface parity with
-        the other sinks (the 39-column file format carries no covariance) and is
-        ignored."""
+        no timestamp column. `covariance`/`jacobian` are accepted for interface
+        parity with the other sinks (the 39-column file format carries neither)
+        and are ignored."""
         del time  # the reader expects PosA at column 0
-        del covariance  # the 39-column file layout has no covariance columns
+        del covariance, jacobian  # the 39-column file layout has no such columns
         if self._file is None:
             raise RuntimeError(f"{type(self).__name__} is not open; call open() first")
 
@@ -610,12 +610,19 @@ class CompositeSink:
     def __init__(self, *sinks):
         self.sinks = list(sinks)
 
-    def publish_state(self, time, state, covariance=None):
-        # Sinks are duck-typed. In-repo sinks accept the ``covariance`` keyword;
-        # a sink written against the original ``publish_state(time, state)``
-        # signature must keep working, so fall back to the two-argument call.
+    def publish_state(self, time, state, covariance=None, jacobian=None):
+        # Sinks are duck-typed. In-repo sinks accept the ``covariance`` and
+        # ``jacobian`` keywords; a sink written against an earlier signature must
+        # keep working, so degrade: both keywords, then covariance only, then the
+        # bare two-argument call.
         results = []
         for sink in self.sinks:
+            try:
+                results.append(sink.publish_state(
+                    time, state, covariance=covariance, jacobian=jacobian))
+                continue
+            except TypeError:
+                pass
             try:
                 results.append(sink.publish_state(time, state, covariance=covariance))
             except TypeError:
@@ -800,15 +807,18 @@ class RodStatePublisher:
         self._topic(rod_name).publish(roslibpy.Message(msg))
         return msg
 
-    def publish_state(self, time, state, covariance=None):
+    def publish_state(self, time, state, covariance=None, jacobian=None):
         """Publish every rod in one flat EKF state vector.
 
         This is the hook ``run_ekf_rollout`` / ``OnlineEKF`` calls once per
         timestep. ``covariance``, when given, is the full
         ``(state_dim, state_dim)`` EKF covariance; each rod's 13x13 diagonal
         block is projected into its Odometry pose/twist covariance. When ``None``
-        the covariances are left zeroed (legacy behavior).
+        the covariances are left zeroed (legacy behavior). ``jacobian`` is
+        accepted for hook parity and ignored -- ``nav_msgs/Odometry`` has no field
+        for it; use :class:`MatrixStreamPublisher` to stream the Jacobian.
         """
+        del jacobian
         rods = split_rod_states(state)
         if self.rod_names is None:
             self.rod_names = [f"rod_{i}" for i in range(len(rods))]
@@ -878,31 +888,45 @@ class MatrixStreamPublisher:
         url: rosbridge websocket URL (defaults to ``ROSBRIDGE_URL`` env var, else
             ``ws://localhost:9090``).
         topic: Topic to advertise (default ``/tensegrity/ekf/covariance``).
-        label: ``dim[0].label`` on the message (default derived from ``form``).
-        form: ``"tangent"`` (default) publishes the minimal, full-rank
-            ``(12*n_rods)`` joint covariance a factor graph wants -- every rod's
-            quaternion block reduced to the 3D small-angle tangent, cross-rod
-            blocks kept (see :func:`state_covariance_to_tangent`); ``"ambient"``
-            publishes the raw ``(13*n_rods)`` EKF covariance unchanged.
-        position_scale, twist_frame: applied to the ``"tangent"`` reduction,
-            matching the per-rod Odometry covariance. Ignored for ``"ambient"``.
+        label: ``dim[0].label`` on the message (default derived from
+            ``source``/``form``).
+        source: ``"covariance"`` (default) publishes the frame's ``covariance``;
+            ``"jacobian"`` publishes the frame's ``jacobian`` (the tangent
+            state-transition Jacobian the EKF hands the hook, already reduced --
+            published as-is, ``form`` does not apply).
+        form: for ``source="covariance"``, ``"tangent"`` (default) publishes the
+            minimal, full-rank ``(12*n_rods)`` joint covariance a factor graph
+            wants -- every rod's quaternion block reduced to the 3D small-angle
+            tangent, cross-rod blocks kept (see
+            :func:`state_covariance_to_tangent`); ``"ambient"`` publishes the raw
+            ``(13*n_rods)`` EKF covariance unchanged.
+        position_scale, twist_frame: applied to the covariance ``"tangent"``
+            reduction, matching the per-rod Odometry covariance. Ignored for
+            ``"ambient"`` and for ``source="jacobian"``.
         queue_size: Per-topic rosbridge queue size.
         connect_timeout: Seconds to wait for the websocket handshake.
     """
 
     def __init__(self, url=None, topic="/tensegrity/ekf/covariance",
-                 label=None, form="tangent",
+                 label=None, source="covariance", form="tangent",
                  position_scale=DEFAULT_POSITION_SCALE, twist_frame="body",
                  queue_size=10, connect_timeout=10.0):
+        if source not in ("covariance", "jacobian"):
+            raise ValueError(f"source must be 'covariance' or 'jacobian', got {source!r}")
         if form not in ("tangent", "ambient"):
             raise ValueError(f"form must be 'tangent' or 'ambient', got {form!r}")
         self.url = url or os.environ.get("ROSBRIDGE_URL", DEFAULT_ROSBRIDGE_URL)
         self.topic = topic
+        self.source = source
         self.form = form
         self.position_scale = float(position_scale)
         self.twist_frame = twist_frame
-        self.label = label if label is not None else (
-            "covariance_tangent" if form == "tangent" else "covariance")
+        if label is not None:
+            self.label = label
+        elif source == "jacobian":
+            self.label = "jacobian_tangent"
+        else:
+            self.label = "covariance_tangent" if form == "tangent" else "covariance"
         self.queue_size = queue_size
         self.connect_timeout = connect_timeout
         self._ros = None
@@ -969,14 +993,19 @@ class MatrixStreamPublisher:
         self._topic_obj.publish(roslibpy.Message(msg))
         return msg
 
-    def publish_state(self, time, state, covariance=None):
-        """Publish this frame's covariance matrix (no-op when ``None``).
+    def publish_state(self, time, state, covariance=None, jacobian=None):
+        """Publish this frame's matrix (no-op when the selected source is None).
 
-        With ``form="tangent"`` the ambient covariance is reduced to the joint
-        tangent covariance using ``state`` (for each rod's quaternion); with
-        ``form="ambient"`` it is published as-is.
+        ``source="jacobian"`` publishes ``jacobian`` as-is (already the tangent
+        Jacobian). ``source="covariance"`` publishes ``covariance``: reduced to
+        the joint tangent form using ``state`` when ``form="tangent"``, or raw
+        when ``form="ambient"``.
         """
         del time
+        if self.source == "jacobian":
+            if jacobian is None:
+                return None
+            return self.publish_matrix(jacobian)
         if covariance is None:
             return None
         if self.form == "tangent":

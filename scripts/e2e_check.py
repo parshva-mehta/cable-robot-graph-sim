@@ -263,9 +263,15 @@ class _FanOut:
     def __init__(self, file_writer, *live_sinks):
         self.sinks = [s for s in (file_writer, *live_sinks) if s is not None]
 
-    def publish_state(self, time, state, covariance=None):
+    def publish_state(self, time, state, covariance=None, jacobian=None):
         out = []
         for s in self.sinks:
+            try:
+                out.append(s.publish_state(
+                    time, state, covariance=covariance, jacobian=jacobian))
+                continue
+            except TypeError:
+                pass
             try:
                 out.append(s.publish_state(time, state, covariance=covariance))
             except TypeError:
@@ -276,23 +282,32 @@ class _FanOut:
 class _CountingSink:
     """Wraps a sink and counts publish_state calls, to prove every frame fired.
 
-    Also records the last (state, covariance) seen so the caller can verify the
-    EKF covariance reached the sink and projects into a non-zero Odometry
-    covariance."""
+    Also records the last (state, covariance, jacobian) seen so the caller can
+    verify the EKF covariance and tangent Jacobian reached the sink."""
 
     def __init__(self, inner):
         self.inner = inner
         self.count = 0
         self.cov_frames = 0
+        self.jac_frames = 0
         self.last_state = None
         self.last_cov = None
+        self.last_jac = None
 
-    def publish_state(self, time, state, covariance=None):
+    def publish_state(self, time, state, covariance=None, jacobian=None):
         self.count += 1
         if covariance is not None:
             self.cov_frames += 1
             self.last_state = state
             self.last_cov = covariance
+        if jacobian is not None:
+            self.jac_frames += 1
+            self.last_jac = jacobian
+        try:
+            return self.inner.publish_state(
+                time, state, covariance=covariance, jacobian=jacobian)
+        except TypeError:
+            pass
         try:
             return self.inner.publish_state(time, state, covariance=covariance)
         except TypeError:
@@ -446,6 +461,24 @@ def main():
         if sym > 1e-8:
             print("  FAIL: joint tangent covariance not symmetric"); ok = False
 
+        # Full joint tangent state-transition Jacobian (df/dx) for the factor
+        # graph -- same 12-per-rod tangent order as the covariance above.
+        if counting.last_jac is None:
+            print("    joint tangent Jacobian: none captured "
+                  "(no finite model Jacobian this run)")
+        else:
+            J = np.asarray(counting.last_jac, dtype=float)
+            jpath = Path(f"joint_jacobian_tangent_{tag}.txt")
+            np.savetxt(jpath, J, fmt="%.9e")
+            print(f"    joint tangent Jacobian ({J.shape[0]}x{J.shape[1]}, df/dx):")
+            print(f"      per-rod order : [x y z rot_x rot_y rot_z vx vy vz wx wy wz]")
+            print(f"      finite        : {bool(np.all(np.isfinite(J)))}")
+            print(f"      full matrix   : saved to {jpath}")
+            print(f"      covariance frames={counting.cov_frames} "
+                  f"jacobian frames={counting.jac_frames} / {n_frames}")
+            if not np.all(np.isfinite(J)):
+                print("  FAIL: joint tangent Jacobian not finite"); ok = False
+
     # ONE shared live publisher, connected once. roslibpy runs a Twisted reactor
     # that cannot be restarted within a process, so a second RodStatePublisher
     # (a second connect after the first terminated) would fail with
@@ -453,6 +486,7 @@ def main():
     # is closed once at the very end.
     live_pub = None
     matrix_pub = None
+    jacobian_pub = None
     if args.ros:
         live_pub = RodStatePublisher(url=args.rosbridge_url,
                                      rod_names=rod_names, stamp_source="sim")
@@ -469,12 +503,21 @@ def main():
         except Exception as exc:  # noqa: BLE001
             print(f"  (full-matrix stream unavailable: {exc})")
             matrix_pub = None
+        try:
+            jacobian_pub = MatrixStreamPublisher(
+                url=args.rosbridge_url, topic="/tensegrity/ekf/jacobian",
+                source="jacobian")
+            jacobian_pub.connect()
+            print(f"  jacobian topic : {jacobian_pub.topic} (joint tangent df/dx)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (jacobian stream unavailable: {exc})")
+            jacobian_pub = None
 
     try:
         # --- Path 1: run_ekf_rollout --------------------------------------
         print("\n[1/2] run_ekf_rollout ...")
         with RolloutStateFileWriter(args.out, expected_n_rods=n_rods) as fw:
-            counting = _CountingSink(_FanOut(fw, live_pub, matrix_pub))
+            counting = _CountingSink(_FanOut(fw, live_pub, matrix_pub, jacobian_pub))
             frames = run_ekf_rollout(sim, gt, extra, args.dt,
                                      use_finite_diff=use_fd, publisher=counting)
         print(f"  sink fired {counting.count} times for {len(frames)} frames")
@@ -491,7 +534,7 @@ def main():
         print("\n[2/2] OnlineEKF (streaming) ...")
         start_state = _build_start_state(gt[0], n_rods)
         with RolloutStateFileWriter(args.out_online, expected_n_rods=n_rods) as fw:
-            online_counting = _CountingSink(_FanOut(fw, live_pub, matrix_pub))
+            online_counting = _CountingSink(_FanOut(fw, live_pub, matrix_pub, jacobian_pub))
             ekf = OnlineEKF(sim, dt=args.dt, n_rods=n_rods, use_finite_diff=use_fd,
                             publisher=online_counting)
             ekf.initialize(start_state,
@@ -510,6 +553,8 @@ def main():
                         DEFAULT_POSITION_SCALE) and ok
         report_covariance(online_counting, n_online_frames, "online")
     finally:
+        if jacobian_pub is not None:
+            jacobian_pub.close()
         if matrix_pub is not None:
             matrix_pub.close()
         if live_pub is not None:

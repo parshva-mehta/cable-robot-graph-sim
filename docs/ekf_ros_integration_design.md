@@ -90,13 +90,27 @@ torch. `_safe_covariance` in `ekf.py` guards the GTSAM covariance read, so a
 missing/non-finite covariance simply leaves that frame's fields zeroed rather
 than failing the filter step.
 
-For a consumer that needs the exact, un-reduced matrix — the full 39×39 state
-covariance, or the state-transition Jacobian `F` once it is plumbed through the
-publisher hook — `MatrixStreamPublisher` ships a whole 2-D matrix per frame on a
-stock `std_msgs/Float64MultiArray` topic (default `/tensegrity/ekf/covariance`),
-so nothing custom has to be compiled inside the Noetic image. It is a duck-typed
-`publish_state` sink and composes with the live Odometry publisher via
-`CompositeSink`.
+For a consumer (e.g. a factor graph) that needs a whole matrix, not the per-rod
+6×6 projection, `MatrixStreamPublisher` ships a full 2-D matrix per frame on a
+stock `std_msgs/Float64MultiArray` topic, so nothing custom has to be compiled
+inside the Noetic image. It is a duck-typed `publish_state` sink and composes
+with the live Odometry publisher via `CompositeSink`. Two things it can carry:
+
+- **Joint covariance** (default, `/tensegrity/ekf/covariance`): with
+  `form="tangent"` the minimal full-rank **36×36** joint covariance
+  (`state_covariance_to_tangent` — quaternion → 3D small-angle, cross-rod blocks
+  kept); `form="ambient"` streams the raw 39×39 EKF covariance.
+- **State-transition Jacobian** (`source="jacobian"`, `/tensegrity/ekf/jacobian`):
+  the **36×36** tangent `df/dx` the EKF computes each step
+  (`_reduce_jacobian_to_tangent` from the raw model Jacobian, before the EKF's
+  stability clamp/regulariser). The EKF returns it and the publish hook carries
+  it as `jacobian=`.
+
+Both matrices use the same per-rod tangent order
+`[x y z rot_x rot_y rot_z vx vy vz wx wy wz]`. The EKF measurement update also
+resolves the quaternion double cover (`_hemisphere_align_measurement`) so an
+antipodal-but-identical orientation measurement does not inject a spurious
+innovation that would inflate these matrices.
 
 ## Hook points (both), with a duck-typed sink
 
