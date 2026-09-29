@@ -141,19 +141,25 @@ python3 scripts/e2e_check.py --ros "${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"}"
 log "Verifying topics"
 "${EXEC_CMD[@]}" 'source /opt/ros/noetic/setup.bash; rostopic list | grep tensegrity'
 
+cat <<EOF
+
+Live view: the step above publishes only a few frames and then exits, so a viewer
+that connects afterward sees nothing (Odometry is not latched). For a live
+Foxglove/RViz view, keep this container (--keep) and CONTINUOUSLY stream:
+
+  ROSBRIDGE_URL=${ROSBRIDGE_URL} python3 scripts/stream_live.py --rate 15
+
+Then in Foxglove connect to ws://localhost:${ROSBRIDGE_PORT} (connection type
+"Rosbridge (ROS 1)"), add a 3D panel, set its fixed frame to "world", and enable
+the /tensegrity/<rod>/odom topics (stream_live also broadcasts /tf so the panel
+can place them). Positions are in meters (rods ~0.325 m, near the origin -- zoom
+in). The synthetic trajectory is a visibility aid; pass --model/--data-dir for
+real motion.
+EOF
 if [[ "$USE_CATKIN" -eq 1 ]]; then
   cat <<EOF
 
-Foxglove: open https://app.foxglove.dev, connect to ws://localhost:${FOXGLOVE_PORT},
-then add a 3D panel -- it renders nav_msgs/Odometry natively. Rods should be
-~0.325 m long.
-EOF
-else
-  cat <<EOF
-
-Foxglove note: foxglove_bridge is only started by the catkin_ws image. Re-run
-with --catkin (and CATKIN_WS set) to get it on ws://localhost:${FOXGLOVE_PORT},
-then open https://app.foxglove.dev and connect to that URL.
+(catkin image) foxglove_bridge is also available on ws://localhost:${FOXGLOVE_PORT}.
 EOF
 fi
 
