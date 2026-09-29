@@ -130,19 +130,20 @@ def main():
         # drag in the simulator stack -- the torch_geometric dependency then
         # surfaces at model load with an actionable message, below.
         import os as _os
+        _mac_root = (
+            "/Users/parshvamehta/Library/Mobile Documents/com~apple~CloudDocs/"
+            "PRACSYS/cablegraphrobot/tensegrity")
         _paths = {
             "model_path": (
                 r"C:\Users\parshva-mehta\OneDrive\Documents\Projects\PRACSYS\Tensegrity"
                 r"\tensegrity\models\best_n_step_rollout_model.pt"
                 if _os.name == "nt" else
-                "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/"
-                "best_rollout_model.pt"),
+                f"{_mac_root}/models/best_rollout_model.pt"),
             "data_dir": (
                 r"C:\Users\parshva-mehta\OneDrive\Documents\Projects\PRACSYS\Tensegrity"
                 r"\tensegrity\data_sets\3bar_new_platform_high_friction\dataset_0\traj_6"
                 if _os.name == "nt" else
-                "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/"
-                "3bar_new_platform_high_friction/dataset_0/traj_6"),
+                f"{_mac_root}/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6"),
         }
         args.model = args.model or _paths["model_path"]
         args.data_dir = args.data_dir or _paths["data_dir"]

@@ -15,15 +15,15 @@ from simulators.tensegrity_gnn_simulator import TensegrityGNNSimulator, load_sim
 from utilities import torch_quaternion
 from utilities.misc_utils import DEFAULT_DTYPE
 
+_MAC_ROOT = (
+    "/Users/parshvamehta/Library/Mobile Documents/com~apple~CloudDocs/PRACSYS/"
+    "cablegraphrobot/tensegrity"
+)
 mac_path = {
     "data_dir": (
-        "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/"
-        "3bar_new_platform_high_friction/dataset_0/traj_6"
+        f"{_MAC_ROOT}/data_sets/3bar_new_platform_high_friction/dataset_0/traj_6"
     ),
-    "model_path": (
-        "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/"
-        "best_rollout_model.pt"
-    ),
+    "model_path": f"{_MAC_ROOT}/models/best_rollout_model.pt",
 }
 windows_path = {
     "data_dir": (
