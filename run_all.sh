@@ -25,8 +25,11 @@
 #                                          # rollout_ekf_online.txt)
 #
 # Env vars (see instructions.md "Configuration"):
-#   ROSBRIDGE_URL   default ws://localhost:9090
-#   CATKIN_WS       path to the catkin_ws checkout (only with --catkin)
+#   ROSBRIDGE_URL    default ws://localhost:9090
+#   CATKIN_WS        path to the catkin_ws checkout (only with --catkin)
+#   DOCKER_PLATFORM  image platform for the stock rosbridge container
+#                    (default linux/amd64 so ROS Noetic runs on Apple Silicon
+#                    via emulation; set DOCKER_PLATFORM= empty for host arch)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -34,6 +37,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 CONTAINER_NAME="rosbridge"
 ROSBRIDGE_PORT="${ROSBRIDGE_PORT:-9090}"
 FOXGLOVE_PORT="${FOXGLOVE_PORT:-8765}"
+# Default to amd64: ROS Noetic publishes no arm64 image, so on Apple Silicon the
+# host-arch pull fails; use '-' (not ':-') so an explicit empty value opts out.
+DOCKER_PLATFORM="${DOCKER_PLATFORM-linux/amd64}"
 export ROSBRIDGE_URL="${ROSBRIDGE_URL:-ws://localhost:${ROSBRIDGE_PORT}}"
 
 USE_CATKIN=0
@@ -100,7 +106,11 @@ if [[ "$USE_CATKIN" -eq 1 ]]; then
   EXEC_CMD=(docker compose -f docker/docker-compose.ros-noetic.yml exec -T ros-noetic bash -lc)
 else
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  # ROS Noetic is x86-only; on Apple Silicon (Colima/Docker Desktop) force the
+  # amd64 image so it runs under emulation instead of failing to find an arm64
+  # manifest. Override with DOCKER_PLATFORM= (empty) to use the host arch.
   docker run -d --name "$CONTAINER_NAME" -p "${ROSBRIDGE_PORT}:9090" \
+    ${DOCKER_PLATFORM:+--platform "$DOCKER_PLATFORM"} \
     ros:noetic-ros-base bash -lc '
       source /opt/ros/noetic/setup.bash
       apt-get update -qq && apt-get install -y -qq --no-install-recommends ros-noetic-rosbridge-server

@@ -690,7 +690,7 @@ class RodStatePublisher:
     def __init__(self, url=None, rod_names=None, frame_id=DEFAULT_FRAME_ID,
                  topic_namespace=DEFAULT_TOPIC_NAMESPACE, stamp_source="wall",
                  twist_frame="body", position_scale=DEFAULT_POSITION_SCALE,
-                 queue_size=10, connect_timeout=10.0):
+                 queue_size=10, connect_timeout=10.0, ros=None):
         if stamp_source not in ("wall", "sim"):
             raise ValueError(
                 f"stamp_source must be 'wall' or 'sim', got {stamp_source!r}"
@@ -710,14 +710,30 @@ class RodStatePublisher:
         self.queue_size = queue_size
         self.connect_timeout = connect_timeout
 
+        # A shared rosbridge connection may be passed in (roslibpy uses a single
+        # global Twisted reactor, so opening several ``Ros`` objects in one
+        # process is fragile). When ``ros`` is given, this publisher reuses it and
+        # never terminates it -- the owner does.
+        self._external_ros = ros
+        self._owns_ros = ros is None
         self._ros = None
         self._topics = {}
+
+    @property
+    def ros(self):
+        """The live ``roslibpy.Ros`` connection (after ``connect``), or None. Pass
+        it as ``ros=`` to another publisher to share one connection."""
+        return self._ros
 
     # -- connection lifecycle ------------------------------------------------
 
     def connect(self):
-        """Open the rosbridge websocket. Idempotent."""
+        """Open (or reuse) the rosbridge websocket. Idempotent."""
         if self._ros is not None:
+            return self
+
+        if self._external_ros is not None:
+            self._ros = self._external_ros
             return self
 
         import roslibpy  # lazy: keeps this module importable without roslibpy
@@ -739,18 +755,23 @@ class RodStatePublisher:
         return self
 
     def close(self):
-        """Unadvertise topics and close the websocket. Idempotent."""
+        """Unadvertise topics and close the websocket. Idempotent.
+
+        A shared connection (passed as ``ros=``) is left open for its owner; only
+        an owned connection is terminated, best-effort (roslibpy's Twisted
+        teardown can raise if the reactor was never fully started)."""
         for topic in self._topics.values():
             try:
                 topic.unadvertise()
             except Exception:  # noqa: BLE001 - best effort during teardown
                 pass
         self._topics.clear()
-        if self._ros is not None:
+        if self._ros is not None and self._owns_ros:
             try:
                 self._ros.terminate()
-            finally:
-                self._ros = None
+            except Exception:  # noqa: BLE001 - roslibpy teardown is flaky
+                pass
+        self._ros = None
 
     def __enter__(self):
         return self.connect()
@@ -905,12 +926,16 @@ class MatrixStreamPublisher:
             ``"ambient"`` and for ``source="jacobian"``.
         queue_size: Per-topic rosbridge queue size.
         connect_timeout: Seconds to wait for the websocket handshake.
+        ros: An existing ``roslibpy.Ros`` connection to reuse (e.g.
+            ``RodStatePublisher(...).ros``). roslibpy uses a single global Twisted
+            reactor, so opening several ``Ros`` objects in one process is fragile;
+            share one instead. A shared connection is never terminated here.
     """
 
     def __init__(self, url=None, topic="/tensegrity/ekf/covariance",
                  label=None, source="covariance", form="tangent",
                  position_scale=DEFAULT_POSITION_SCALE, twist_frame="body",
-                 queue_size=10, connect_timeout=10.0):
+                 queue_size=10, connect_timeout=10.0, ros=None):
         if source not in ("covariance", "jacobian"):
             raise ValueError(f"source must be 'covariance' or 'jacobian', got {source!r}")
         if form not in ("tangent", "ambient"):
@@ -929,29 +954,40 @@ class MatrixStreamPublisher:
             self.label = "covariance_tangent" if form == "tangent" else "covariance"
         self.queue_size = queue_size
         self.connect_timeout = connect_timeout
+        self._external_ros = ros
+        self._owns_ros = ros is None
         self._ros = None
         self._topic_obj = None
 
+    @property
+    def ros(self):
+        """The live ``roslibpy.Ros`` connection (after ``connect``), or None."""
+        return self._ros
+
     def connect(self):
-        """Open the rosbridge websocket and advertise the topic. Idempotent."""
-        if self._ros is not None:
+        """Open (or reuse) the rosbridge websocket and advertise the topic.
+        Idempotent."""
+        if self._topic_obj is not None:
             return self
 
         import roslibpy  # lazy: keeps this module importable without roslibpy
 
-        url = self.url
-        if "://" not in url:
-            url = "ws://" + url
-        scheme, _, hostport = url.partition("://")
-        host, _, port = hostport.partition(":")
-        ros = roslibpy.Ros(
-            host=host,
-            port=int(port) if port else 9090,
-            is_secure=(scheme == "wss"),
-        )
-        ros.run(timeout=self.connect_timeout)
-        if not ros.is_connected:
-            raise ConnectionError(f"could not connect to rosbridge at {self.url}")
+        if self._external_ros is not None:
+            ros = self._external_ros
+        else:
+            url = self.url
+            if "://" not in url:
+                url = "ws://" + url
+            scheme, _, hostport = url.partition("://")
+            host, _, port = hostport.partition(":")
+            ros = roslibpy.Ros(
+                host=host,
+                port=int(port) if port else 9090,
+                is_secure=(scheme == "wss"),
+            )
+            ros.run(timeout=self.connect_timeout)
+            if not ros.is_connected:
+                raise ConnectionError(f"could not connect to rosbridge at {self.url}")
         self._ros = ros
         self._topic_obj = roslibpy.Topic(
             ros, self.topic, FLOAT64_MULTIARRAY_MSG_TYPE, queue_size=self.queue_size
@@ -963,18 +999,23 @@ class MatrixStreamPublisher:
     open = connect
 
     def close(self):
-        """Unadvertise and close the websocket. Idempotent."""
+        """Unadvertise and, if owned, close the websocket. Idempotent.
+
+        A shared connection (passed as ``ros=``) is left for its owner; an owned
+        connection is terminated best-effort (roslibpy's Twisted teardown can
+        raise if the reactor was never fully started)."""
         if self._topic_obj is not None:
             try:
                 self._topic_obj.unadvertise()
             except Exception:  # noqa: BLE001 - best effort during teardown
                 pass
             self._topic_obj = None
-        if self._ros is not None:
+        if self._ros is not None and self._owns_ros:
             try:
                 self._ros.terminate()
-            finally:
-                self._ros = None
+            except Exception:  # noqa: BLE001 - roslibpy teardown is flaky
+                pass
+        self._ros = None
 
     def __enter__(self):
         return self.connect()

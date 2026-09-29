@@ -496,8 +496,10 @@ def main():
         # -- the matrix a factor graph consumes. Best-effort: a second rosbridge
         # connection may be unavailable, in which case the file/printed proof
         # still carries the matrix.
+        # Reuse the one rosbridge connection for the matrix streams -- roslibpy's
+        # single global Twisted reactor makes multiple Ros objects fragile.
         try:
-            matrix_pub = MatrixStreamPublisher(url=args.rosbridge_url, form="tangent")
+            matrix_pub = MatrixStreamPublisher(form="tangent", ros=live_pub.ros)
             matrix_pub.connect()
             print(f"  matrix topic : {matrix_pub.topic} (joint tangent covariance)")
         except Exception as exc:  # noqa: BLE001
@@ -505,8 +507,8 @@ def main():
             matrix_pub = None
         try:
             jacobian_pub = MatrixStreamPublisher(
-                url=args.rosbridge_url, topic="/tensegrity/ekf/jacobian",
-                source="jacobian")
+                topic="/tensegrity/ekf/jacobian", source="jacobian",
+                ros=live_pub.ros)
             jacobian_pub.connect()
             print(f"  jacobian topic : {jacobian_pub.topic} (joint tangent df/dx)")
         except Exception as exc:  # noqa: BLE001

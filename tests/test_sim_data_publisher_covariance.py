@@ -351,6 +351,27 @@ def test_matrix_stream_publisher_rejects_bad_source():
         sdp.MatrixStreamPublisher(source="hessian")
 
 
+def test_shared_connection_not_terminated_by_borrower(fake_roslibpy):
+    """A MatrixStreamPublisher given ros= reuses the connection, advertises its
+    own topic on it, and does NOT terminate it on close -- only the owner does.
+    This is the fix for the roslibpy multi-reactor teardown crash."""
+    owner = sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"])
+    owner.connect()
+    shared = owner.ros
+    assert shared is not None
+    assert len(fake_roslibpy.instances) == 1  # exactly one Ros connection
+
+    borrower = sdp.MatrixStreamPublisher(source="jacobian", ros=shared)
+    borrower.connect()
+    assert borrower.ros is shared
+    assert len(fake_roslibpy.instances) == 1  # no second connection opened
+
+    borrower.close()
+    assert not shared.terminated          # borrower must not kill the shared conn
+    owner.close()
+    assert shared.terminated              # owner terminates it once
+
+
 # -- build_odometry_msg with covariance --------------------------------------
 
 def test_build_odometry_msg_zeroes_covariance_by_default():
