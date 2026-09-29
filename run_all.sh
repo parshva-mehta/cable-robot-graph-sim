@@ -140,7 +140,9 @@ else
     ${DOCKER_PLATFORM:+--platform "$DOCKER_PLATFORM"} \
     ros:noetic-ros-base bash -lc '
       source /opt/ros/noetic/setup.bash
-      apt-get update -qq && apt-get install -y -qq --no-install-recommends ros-noetic-rosbridge-server
+      # tf2-msgs is NOT in ros-noetic-ros-base; without it rosbridge cannot
+      # advertise /tf (tf2_msgs/TFMessage) and the 3D panel gets no frames.
+      apt-get update -qq && apt-get install -y -qq --no-install-recommends ros-noetic-rosbridge-server ros-noetic-tf2-msgs
       roscore & sleep 6
       roslaunch --wait rosbridge_server rosbridge_websocket.launch address:=0.0.0.0 port:=9090
     '
