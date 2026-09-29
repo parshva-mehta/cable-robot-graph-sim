@@ -111,6 +111,10 @@ def main():
     ap.add_argument("--freq", type=float, default=0.2, help="synthetic motion Hz")
     ap.add_argument("--no-matrices", action="store_true",
                     help="skip the covariance/jacobian Float64MultiArray topics")
+    ap.add_argument("--gnn-jacobian", action="store_true",
+                    help="linearize with the GNN Jacobian (torch.func.jacrev) "
+                         "instead of finite differences -- much faster with a real "
+                         "--model (one pass vs ~78), so the stream can keep up")
     ap.add_argument("--no-tf", action="store_true",
                     help="skip the /tf world->rod broadcast (needed for the "
                          "Foxglove/RViz 3D panel to place the rods)")
@@ -159,7 +163,8 @@ def main():
         print("            /tf (world -> each rod, for the 3D panel)")
 
     # observe_pose_only keeps the synthetic measurement simple (pos+quat).
-    ekf = OnlineEKF(sim, dt=args.dt, n_rods=n_rods, use_finite_diff=True,
+    ekf = OnlineEKF(sim, dt=args.dt, n_rods=n_rods,
+                    use_finite_diff=not args.gnn_jacobian,
                     observe_pose_only=(gt is None), publisher=pub)
 
     if gt is not None:
