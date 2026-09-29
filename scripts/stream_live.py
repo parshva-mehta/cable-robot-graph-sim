@@ -125,15 +125,43 @@ def main():
     args = ap.parse_args()
 
     if args.best:
-        # Reuse eval.py's default model/trajectory paths (single source of truth).
-        from eval import _default_eval_paths
-        args.model = args.model or _default_eval_paths["model_path"]
-        args.data_dir = args.data_dir or _default_eval_paths["data_dir"]
+        # Same default model/trajectory paths as eval.py (mac/windows aware).
+        # Kept inline (not imported from eval.py) so resolving the paths does not
+        # drag in the simulator stack -- the torch_geometric dependency then
+        # surfaces at model load with an actionable message, below.
+        import os as _os
+        _paths = {
+            "model_path": (
+                r"C:\Users\parshva-mehta\OneDrive\Documents\Projects\PRACSYS\Tensegrity"
+                r"\tensegrity\models\best_n_step_rollout_model.pt"
+                if _os.name == "nt" else
+                "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/models/"
+                "best_rollout_model.pt"),
+            "data_dir": (
+                r"C:\Users\parshva-mehta\OneDrive\Documents\Projects\PRACSYS\Tensegrity"
+                r"\tensegrity\data_sets\3bar_new_platform_high_friction\dataset_0\traj_6"
+                if _os.name == "nt" else
+                "/Users/parshvamehta/PRACSYS/cablegraphrobot/tensegrity/data_sets/"
+                "3bar_new_platform_high_friction/dataset_0/traj_6"),
+        }
+        args.model = args.model or _paths["model_path"]
+        args.data_dir = args.data_dir or _paths["data_dir"]
         print(f"(--best) model={args.model}")
         print(f"(--best) data ={args.data_dir}")
 
-    sim = (load_real_simulator(args.model) if args.model
-           else build_stub_simulator(args.config))
+    try:
+        sim = (load_real_simulator(args.model) if args.model
+               else build_stub_simulator(args.config))
+    except ModuleNotFoundError as exc:
+        if "torch_geometric" in str(exc):
+            sys.exit(
+                "error: loading the trained model needs torch_geometric, which is "
+                "not in this Python env.\n"
+                "  Activate the project env:  conda activate cable_robot_gnn\n"
+                "  or install deps:           pip install -r requirements.txt\n"
+                "  (the synthetic stub stream -- no --model/--best -- needs neither)."
+            )
+        raise
     rod_names = rod_names_from_simulator(sim)
     n_rods = len(rod_names)
     n_cables = len(sim.robot.actuated_cables)
