@@ -119,6 +119,7 @@ fi
 # --- 2. Open the message pipeline ---------------------------------------
 log "2/3 Starting ROS Noetic + rosbridge"
 
+REUSED=0
 if [[ "$USE_CATKIN" -eq 1 ]]; then
   : "${CATKIN_WS:?--catkin requires CATKIN_WS to point at your catkin_ws checkout}"
   export CATKIN_WS
@@ -129,6 +130,7 @@ elif docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   # Already running (e.g. left up by a previous --stream/--keep run): reuse it so
   # we skip the slow first-boot apt install of rosbridge.
   echo "Reusing the already-running '$CONTAINER_NAME' container."
+  REUSED=1
   READY_CMD=(docker logs "$CONTAINER_NAME")
   EXEC_CMD=(docker exec "$CONTAINER_NAME" bash -lc)
 else
@@ -150,14 +152,19 @@ else
   EXEC_CMD=(docker exec "$CONTAINER_NAME" bash -lc)
 fi
 
-echo "Waiting for rosbridge to come up (first run installs packages, can take a few minutes)..."
+# Readiness: probe the actual websocket port (authoritative -- works whether the
+# container is fresh or reused, unlike grepping logs which can miss the line
+# after a docker restart / log rotation). Fall back to the log line too.
+port_open() { (exec 3<>"/dev/tcp/localhost/${ROSBRIDGE_PORT}") >/dev/null 2>&1; }
+echo "Waiting for rosbridge on ws://localhost:${ROSBRIDGE_PORT} (first run installs packages, can take a few minutes)..."
 for i in $(seq 1 90); do
-  if "${READY_CMD[@]}" 2>&1 | grep -q "Rosbridge WebSocket server started"; then
+  if port_open || "${READY_CMD[@]}" 2>&1 | grep -q "Rosbridge WebSocket server started"; then
     echo "rosbridge is up."
     break
   fi
   if [[ "$i" -eq 90 ]]; then
-    echo "Timed out waiting for rosbridge to start." >&2
+    echo "Timed out waiting for rosbridge on port ${ROSBRIDGE_PORT}." >&2
+    echo "Tip: 'docker rm -f ${CONTAINER_NAME}' and re-run to rebuild it." >&2
     exit 1
   fi
   sleep 5
