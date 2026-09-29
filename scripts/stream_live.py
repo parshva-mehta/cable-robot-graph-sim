@@ -99,6 +99,10 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--data-dir", default=None)
+    ap.add_argument("--best", action="store_true",
+                    help="use the trained model + trajectory from eval.py's default "
+                         "paths (best_rollout_model.pt + traj_6); fills --model and "
+                         "--data-dir if unset")
     ap.add_argument("--rosbridge-url", default=None)
     ap.add_argument("--rate", type=float, default=10.0, help="publish rate (Hz)")
     ap.add_argument("--duration", type=float, default=0.0,
@@ -119,6 +123,14 @@ def main():
                     help="skip the /tf world->rod broadcast (needed for the "
                          "Foxglove/RViz 3D panel to place the rods)")
     args = ap.parse_args()
+
+    if args.best:
+        # Reuse eval.py's default model/trajectory paths (single source of truth).
+        from eval import _default_eval_paths
+        args.model = args.model or _default_eval_paths["model_path"]
+        args.data_dir = args.data_dir or _default_eval_paths["data_dir"]
+        print(f"(--best) model={args.model}")
+        print(f"(--best) data ={args.data_dir}")
 
     sim = (load_real_simulator(args.model) if args.model
            else build_stub_simulator(args.config))

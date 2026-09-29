@@ -15,6 +15,9 @@
 #                                          # tests -> rosbridge -> continuous
 #                                          # publish until Ctrl-C. Reuses a running
 #                                          # container and leaves it up for reuse.
+#   ./run_all.sh --best                    # stream the trained model + trajectory
+#                                          # from eval.py's paths (implies --stream,
+#                                          # uses the fast jacrev linearization)
 #   ./run_all.sh --stream --rate 20 --model best.pt --data-dir path/to/traj_6
 #   ./run_all.sh --model best_model.pt --data-dir path/to/traj_6
 #   ./run_all.sh --catkin                 # use the catkin_ws image instead
@@ -29,8 +32,10 @@
 #                                          # file(s) (rollout_ekf.txt /
 #                                          # rollout_ekf_online.txt)
 #
-# Flags: --stream (continuous live publish for Foxglove), --rate <hz> (with
-# --stream, default 15), --keep, --catkin, --file-only, --model, --data-dir.
+# Flags: --stream (continuous live publish for Foxglove), --best (stream the
+# trained model+traj from eval.py; implies --stream + fast jacrev linearization),
+# --rate <hz> (with --stream, default 15), --keep, --catkin, --file-only,
+# --model, --data-dir.
 #
 # Env vars (see instructions.md "Configuration"):
 #   ROSBRIDGE_URL    default ws://localhost:9090
@@ -54,6 +59,8 @@ USE_CATKIN=0
 KEEP=0
 FILE_ONLY=0
 STREAM=0
+BEST=0
+HAVE_MODEL=0
 RATE=15
 MODEL_ARGS=()
 
@@ -63,8 +70,9 @@ while [[ $# -gt 0 ]]; do
     --keep) KEEP=1; shift ;;
     --file-only) FILE_ONLY=1; shift ;;
     --stream) STREAM=1; shift ;;
+    --best) BEST=1; STREAM=1; HAVE_MODEL=1; shift ;;   # trained model + traj (eval.py paths)
     --rate) RATE="$2"; shift 2 ;;
-    --model) MODEL_ARGS+=(--model "$2"); shift 2 ;;
+    --model) MODEL_ARGS+=(--model "$2"); HAVE_MODEL=1; shift 2 ;;
     --data-dir) MODEL_ARGS+=(--data-dir "$2"); shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -186,7 +194,13 @@ Connect Foxglove NOW, then leave this running:
 Streaming at ${RATE} Hz -- press Ctrl-C to stop (the container is left running for
 next time; remove it with: docker rm -f ${CONTAINER_NAME}).
 EOF
-  python3 scripts/stream_live.py --rate "$RATE" "${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"}"
+  STREAM_ARGS=(--rate "$RATE")
+  [[ "$BEST" -eq 1 ]] && STREAM_ARGS+=(--best)
+  # A real model is far too slow to linearize with finite differences in real
+  # time; use the analytic (jacrev) Jacobian so the stream keeps up.
+  [[ "$HAVE_MODEL" -eq 1 ]] && STREAM_ARGS+=(--gnn-jacobian)
+  STREAM_ARGS+=("${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"}")
+  python3 scripts/stream_live.py "${STREAM_ARGS[@]}"
   log "Done"
   exit 0
 fi
