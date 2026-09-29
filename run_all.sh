@@ -11,6 +11,11 @@
 #
 # Usage:
 #   ./run_all.sh                          # stock image, stub sim, synthetic data
+#   ./run_all.sh --stream                 # ONE command for a live Foxglove view:
+#                                          # tests -> rosbridge -> continuous
+#                                          # publish until Ctrl-C. Reuses a running
+#                                          # container and leaves it up for reuse.
+#   ./run_all.sh --stream --rate 20 --model best.pt --data-dir path/to/traj_6
 #   ./run_all.sh --model best_model.pt --data-dir path/to/traj_6
 #   ./run_all.sh --catkin                 # use the catkin_ws image instead
 #                                          # (also starts foxglove_bridge on
@@ -23,6 +28,9 @@
 #                                          # source data and write the rollout
 #                                          # file(s) (rollout_ekf.txt /
 #                                          # rollout_ekf_online.txt)
+#
+# Flags: --stream (continuous live publish for Foxglove), --rate <hz> (with
+# --stream, default 15), --keep, --catkin, --file-only, --model, --data-dir.
 #
 # Env vars (see instructions.md "Configuration"):
 #   ROSBRIDGE_URL    default ws://localhost:9090
@@ -45,6 +53,8 @@ export ROSBRIDGE_URL="${ROSBRIDGE_URL:-ws://localhost:${ROSBRIDGE_PORT}}"
 USE_CATKIN=0
 KEEP=0
 FILE_ONLY=0
+STREAM=0
+RATE=15
 MODEL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -52,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     --catkin) USE_CATKIN=1; shift ;;
     --keep) KEEP=1; shift ;;
     --file-only) FILE_ONLY=1; shift ;;
+    --stream) STREAM=1; shift ;;
+    --rate) RATE="$2"; shift 2 ;;
     --model) MODEL_ARGS+=(--model "$2"); shift 2 ;;
     --data-dir) MODEL_ARGS+=(--data-dir "$2"); shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -61,6 +73,15 @@ done
 if [[ "$FILE_ONLY" -eq 1 && "$USE_CATKIN" -eq 1 ]]; then
   echo "--file-only and --catkin are mutually exclusive." >&2
   exit 1
+fi
+if [[ "$STREAM" -eq 1 && "$FILE_ONLY" -eq 1 ]]; then
+  echo "--stream needs the live ROS pipeline; it is incompatible with --file-only." >&2
+  exit 1
+fi
+# --stream keeps the container up so re-running is instant (it is reused, not
+# rebuilt). Remove it yourself with: docker rm -f rosbridge
+if [[ "$STREAM" -eq 1 ]]; then
+  KEEP=1
 fi
 
 log() { printf '\n=== %s ===\n' "$1"; }
@@ -104,6 +125,12 @@ if [[ "$USE_CATKIN" -eq 1 ]]; then
   docker compose -f docker/docker-compose.ros-noetic.yml up -d --build
   READY_CMD=(docker compose -f docker/docker-compose.ros-noetic.yml logs)
   EXEC_CMD=(docker compose -f docker/docker-compose.ros-noetic.yml exec -T ros-noetic bash -lc)
+elif docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  # Already running (e.g. left up by a previous --stream/--keep run): reuse it so
+  # we skip the slow first-boot apt install of rosbridge.
+  echo "Reusing the already-running '$CONTAINER_NAME' container."
+  READY_CMD=(docker logs "$CONTAINER_NAME")
+  EXEC_CMD=(docker exec "$CONTAINER_NAME" bash -lc)
 else
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   # ROS Noetic is x86-only; on Apple Silicon (Colima/Docker Desktop) force the
@@ -135,6 +162,26 @@ for i in $(seq 1 90); do
 done
 
 # --- 3. Actual data transfer ---------------------------------------------
+if [[ "$STREAM" -eq 1 ]]; then
+  log "3/3 Live-streaming EKF state to ROS (continuous)"
+  cat <<EOF
+
+Connect Foxglove NOW, then leave this running:
+  1. Foxglove -> Open connection -> "Rosbridge (ROS 1)" -> ws://localhost:${ROSBRIDGE_PORT}
+  2. Add a 3D panel; in its settings set Fixed frame = "world".
+  3. Enable the /tensegrity/<rod>/odom topics and zoom in (rods ~0.325 m, near
+     the origin). /tf (world -> rod) is broadcast so the panel can place them.
+  4. Raw Messages panels on /tensegrity/ekf/covariance and /tensegrity/ekf/jacobian
+     show the 36x36 matrices.
+
+Streaming at ${RATE} Hz -- press Ctrl-C to stop (the container is left running for
+next time; remove it with: docker rm -f ${CONTAINER_NAME}).
+EOF
+  python3 scripts/stream_live.py --rate "$RATE" "${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"}"
+  log "Done"
+  exit 0
+fi
+
 log "3/3 Streaming EKF state to ROS"
 python3 scripts/e2e_check.py --ros "${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"}"
 
@@ -145,9 +192,13 @@ cat <<EOF
 
 Live view: the step above publishes only a few frames and then exits, so a viewer
 that connects afterward sees nothing (Odometry is not latched). For a live
-Foxglove/RViz view, keep this container (--keep) and CONTINUOUSLY stream:
+Foxglove/RViz view, run everything in one shot with:
 
-  ROSBRIDGE_URL=${ROSBRIDGE_URL} python3 scripts/stream_live.py --rate 15
+  ./run_all.sh --stream
+
+or, against this already-running container, just:
+
+  ROSBRIDGE_URL=${ROSBRIDGE_URL} python3 scripts/stream_live.py --rate ${RATE}
 
 Then in Foxglove connect to ws://localhost:${ROSBRIDGE_PORT} (connection type
 "Rosbridge (ROS 1)"), add a 3D panel, set its fixed frame to "world", and enable
