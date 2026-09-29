@@ -6,6 +6,9 @@ numpy-quaternion
 opencv-python
 Pillow
 torch
+# GNN simulator (simulators/tensegrity_gnn_simulator.py imports
+# torch_geometric.data.Data); required to load/run any trained .pt model.
+torch_geometric
 tqdm
 # Live EKF -> ROS bridge (sim_data_publisher.RodStatePublisher). Pure-Python
 # rosbridge websocket client -- no rospy/catkin, no ROS install needed here.
