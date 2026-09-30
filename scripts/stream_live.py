@@ -67,6 +67,20 @@ def _build_tf_message(state_flat, rod_names, scale, frame_id="world"):
     return {"transforms": transforms}
 
 
+def _build_path_message(history, frame_id="world"):
+    """A nav_msgs/Path from a list of (stamp, position_m, ros_quat) samples.
+    Foxglove's 3D panel draws Path as a line, which gives the position trail
+    that a single Odometry message (one pose, latest only) cannot."""
+    return {
+        "header": {"stamp": history[-1][0], "frame_id": frame_id},
+        "poses": [{
+            "header": {"stamp": stamp, "frame_id": frame_id},
+            "pose": {"position": {"x": p[0], "y": p[1], "z": p[2]},
+                     "orientation": q},
+        } for stamp, p, q in history],
+    }
+
+
 def _config_base_state(config_path, n_rods):
     """Per-rod COM (midpoint of config end_pts) with identity orientation."""
     cfg = json.load(open(config_path))
@@ -122,6 +136,12 @@ def main():
     ap.add_argument("--no-tf", action="store_true",
                     help="skip the /tf world->rod broadcast (needed for the "
                          "Foxglove/RViz 3D panel to place the rods)")
+    ap.add_argument("--trail", type=int, default=300,
+                    help="poses kept in each rod's /tensegrity/<rod>/path trail "
+                         "(0 = disable the trail topics)")
+    ap.add_argument("--trail-every", type=int, default=3,
+                    help="publish the trail every N frames (the Path message "
+                         "grows with --trail, so this bounds the bandwidth)")
     args = ap.parse_args()
 
     if args.best:
@@ -203,6 +223,21 @@ def main():
         tf_topic.advertise()
         print("            /tf (world -> each rod, for the 3D panel)")
 
+    # Per-rod trail: a rolling nav_msgs/Path so the 3D panel can draw where each
+    # rod has been. Odometry alone renders only the latest pose.
+    path_topics = {}
+    trails = {}
+    if args.trail > 0:
+        import collections
+        import roslibpy
+        for name in rod_names:
+            t = roslibpy.Topic(live.ros, f"/tensegrity/{name}/path", "nav_msgs/Path")
+            t.advertise()
+            path_topics[name] = t
+            trails[name] = collections.deque(maxlen=args.trail)
+        print("            /tensegrity/<rod>/path (position trail, "
+              f"last {args.trail} poses)")
+
     # observe_pose_only keeps the synthetic measurement simple (pos+quat).
     ekf = OnlineEKF(sim, dt=args.dt, n_rods=n_rods,
                     use_finite_diff=not args.gnn_jacobian,
@@ -250,6 +285,19 @@ def main():
                 st = ekf.state_torch.detach().cpu().numpy().reshape(-1)
                 tf_topic.publish(roslibpy.Message(
                     _build_tf_message(st, rod_names, DEFAULT_POSITION_SCALE)))
+            if path_topics:
+                import roslibpy
+                st = ekf.state_torch.detach().cpu().numpy().reshape(-1)
+                stamp = ros_time_from_seconds(time.time())
+                for name, (pos, quat, _lv, _av) in zip(rod_names,
+                                                       split_rod_states(st)):
+                    trails[name].append((
+                        stamp,
+                        [float(c) * DEFAULT_POSITION_SCALE for c in pos],
+                        quat_wxyz_to_ros(quat)))
+                if k % max(args.trail_every, 1) == 0:
+                    for name, t in path_topics.items():
+                        t.publish(roslibpy.Message(_build_path_message(trails[name])))
             k += 1
             if k % max(int(args.rate), 1) == 0:
                 print(f"  t={t:6.1f}s  frames={k}", end="\r", flush=True)
@@ -257,6 +305,11 @@ def main():
     except KeyboardInterrupt:
         print("\nstopping ...")
     finally:
+        for t in path_topics.values():
+            try:
+                t.unadvertise()
+            except Exception:  # noqa: BLE001
+                pass
         if tf_topic is not None:
             try:
                 tf_topic.unadvertise()
