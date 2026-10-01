@@ -74,6 +74,10 @@ import time as _time
 # 13 = pos(3) + quat(4) + linvel(3) + angvel(3)
 STATE_DIM_PER_ROD = 13
 
+# 12 = pos(3) + rot(3) + linvel(3) + angvel(3); the exp-map filter's covariance
+# and Jacobian live in this minimal tangent layout.
+TANGENT_DIM_PER_ROD = 12
+
 DEFAULT_ROSBRIDGE_URL = "ws://localhost:9090"
 ODOMETRY_MSG_TYPE = "nav_msgs/Odometry"
 DEFAULT_TOPIC_NAMESPACE = "/tensegrity"
@@ -308,21 +312,85 @@ def rod_covariance_to_ros(rod_cov, quat, position_scale=DEFAULT_POSITION_SCALE,
     return pose6.reshape(-1).tolist(), twist6.reshape(-1).tolist()
 
 
-def split_rod_covariances(covariance, n_rods):
-    """Split a flat/2D EKF covariance into per-rod 13x13 diagonal blocks.
+def rod_tangent_covariance_to_ros(rod_cov, quat,
+                                  position_scale=DEFAULT_POSITION_SCALE,
+                                  twist_frame="body"):
+    """Project one rod's 12x12 tangent covariance to ROS ``(pose_cov, twist_cov)``.
 
-    Cross-rod covariance is dropped -- ``nav_msgs/Odometry`` is per-body, so only
-    each rod's own 13x13 diagonal block maps onto its pose/twist covariance.
+    The exp-map filter (``ekf_gtsam``) carries its covariance directly in the
+    tangent layout ``[x y z rot_x rot_y rot_z vx vy vz wx wy wz]``, so unlike
+    :func:`rod_covariance_to_ros` there is no quaternion block to reduce -- only
+    the frame rotation and the length scaling apply.
+
+    Args:
+        rod_cov: 12x12 covariance in the per-rod tangent order above, world frame.
+        quat: The rod's orientation as repo-order ``(w, x, y, z)``, used only for
+            the body/world frame rotation.
+        position_scale: Simulator-units-to-meters factor; variances of length
+            dimensions scale by ``s**2``.
+        twist_frame: ``"body"`` (default) rotates the orientation and twist
+            blocks into the body frame; ``"world"`` leaves them in world.
+
+    Returns:
+        ``(pose_cov, twist_cov)`` -- two row-major flattened 6x6 lists, ordered
+        exactly as :func:`rod_covariance_to_ros` returns them.
+    """
+    if twist_frame not in ("body", "world"):
+        raise ValueError(f"twist_frame must be 'body' or 'world', got {twist_frame!r}")
+
+    import numpy as np
+    P = np.asarray(rod_cov, dtype=float).reshape(
+        TANGENT_DIM_PER_ROD, TANGENT_DIM_PER_ROD
+    )
+    R = _rotation_matrix_wxyz(quat)    # (3, 3) world <- body
+    s = float(position_scale)
+
+    pose6 = P[0:6, 0:6].copy()
+    twist6 = P[6:12, 6:12].copy()
+
+    if twist_frame == "body":
+        M = np.zeros((6, 6))
+        M[0:3, 0:3] = R.T
+        M[3:6, 3:6] = R.T
+        pose6 = M @ pose6 @ M.T
+        twist6 = M @ twist6 @ M.T
+
+    pose6[0:3, 0:3] *= s * s
+    pose6[0:3, 3:6] *= s
+    pose6[3:6, 0:3] *= s
+
+    twist6[0:3, 0:3] *= s * s
+    twist6[0:3, 3:6] *= s
+    twist6[3:6, 0:3] *= s
+
+    return pose6.reshape(-1).tolist(), twist6.reshape(-1).tolist()
+
+
+def split_rod_covariances(covariance, n_rods):
+    """Split a flat/2D EKF covariance into per-rod diagonal blocks.
+
+    Handles both filter layouts: the ambient quaternion covariance
+    (``13*n_rods`` square) and the exp-map tangent covariance (``12*n_rods``
+    square), returning 13x13 or 12x12 blocks respectively. Cross-rod covariance
+    is dropped -- ``nav_msgs/Odometry`` is per-body.
     """
     import numpy as np
-    C = np.asarray(covariance, dtype=float).reshape(
-        n_rods * STATE_DIM_PER_ROD, n_rods * STATE_DIM_PER_ROD
-    )
-    return [
-        C[i * STATE_DIM_PER_ROD:(i + 1) * STATE_DIM_PER_ROD,
-          i * STATE_DIM_PER_ROD:(i + 1) * STATE_DIM_PER_ROD]
-        for i in range(n_rods)
-    ]
+    C = np.asarray(covariance, dtype=float)
+    side = int(round(np.sqrt(C.size)))
+    if side * side != C.size:
+        raise ValueError(f"covariance is not square: size {C.size}")
+    if side == n_rods * STATE_DIM_PER_ROD:
+        d = STATE_DIM_PER_ROD
+    elif side == n_rods * TANGENT_DIM_PER_ROD:
+        d = TANGENT_DIM_PER_ROD
+    else:
+        raise ValueError(
+            f"covariance side {side} matches neither the ambient "
+            f"({n_rods * STATE_DIM_PER_ROD}) nor the tangent "
+            f"({n_rods * TANGENT_DIM_PER_ROD}) layout for {n_rods} rods"
+        )
+    C = C.reshape(side, side)
+    return [C[i * d:(i + 1) * d, i * d:(i + 1) * d] for i in range(n_rods)]
 
 
 def _rod_reduction_matrix(quat, position_scale, twist_frame):
@@ -378,9 +446,12 @@ def state_covariance_to_tangent(covariance, state,
     import numpy as np
     rods = split_rod_states(state)
     n = len(rods)
-    C = np.asarray(covariance, dtype=float).reshape(
-        n * STATE_DIM_PER_ROD, n * STATE_DIM_PER_ROD
-    )
+    C = np.asarray(covariance, dtype=float)
+    if C.size == (n * TANGENT_DIM_PER_ROD) ** 2:
+        # Already the minimal tangent form (the exp-map filter's own covariance)
+        # -- it is what this function would produce, so pass it through.
+        return C.reshape(n * TANGENT_DIM_PER_ROD, n * TANGENT_DIM_PER_ROD)
+    C = C.reshape(n * STATE_DIM_PER_ROD, n * STATE_DIM_PER_ROD)
     M = np.zeros((n * 12, n * STATE_DIM_PER_ROD))
     for i, (pos, quat, lv, av) in enumerate(rods):
         M[i * 12:(i + 1) * 12, i * STATE_DIM_PER_ROD:(i + 1) * STATE_DIM_PER_ROD] = \
@@ -441,7 +512,12 @@ def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
         angvel = rotate_world_to_body(quat, angvel)
 
     if rod_covariance is not None:
-        pose_cov, twist_cov = rod_covariance_to_ros(
+        import numpy as np
+        convert = (rod_tangent_covariance_to_ros
+                   if np.asarray(rod_covariance).size
+                   == TANGENT_DIM_PER_ROD * TANGENT_DIM_PER_ROD
+                   else rod_covariance_to_ros)
+        pose_cov, twist_cov = convert(
             rod_covariance, quat, position_scale=position_scale,
             twist_frame=twist_frame,
         )

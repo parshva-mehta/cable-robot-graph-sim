@@ -46,7 +46,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ekf_gtsam import OnlineEKF, run_ekf_rollout
-from sim_data_publisher import (STATE_DIM_PER_ROD, DEFAULT_POSITION_SCALE,
+from sim_data_publisher import (STATE_DIM_PER_ROD, TANGENT_DIM_PER_ROD,
+                                DEFAULT_POSITION_SCALE,
                                 CompositeSink, RodStatePublisher,
                                 RolloutStateFileWriter, rod_names_from_simulator,
                                 build_odometry_msg, split_rod_states,
@@ -395,8 +396,12 @@ def main():
             print("  FAIL: covariance missing on some frames"); ok = False
             return
         cov = np.asarray(counting.last_cov)
-        if cov.shape != (n_rods * STATE_DIM_PER_ROD, n_rods * STATE_DIM_PER_ROD):
-            print(f"  FAIL: covariance shape {cov.shape}"); ok = False
+        # The exp-map filter publishes the 12-per-rod tangent covariance; the
+        # ambient 13-per-rod form is still accepted.
+        expected_sides = {n_rods * STATE_DIM_PER_ROD, n_rods * TANGENT_DIM_PER_ROD}
+        if cov.shape[0] not in expected_sides or cov.shape[0] != cov.shape[1]:
+            print(f"  FAIL: covariance shape {cov.shape}, "
+                  f"expected one of {sorted(expected_sides)} square"); ok = False
             return
         rods = split_rod_states(counting.last_state)
         blocks = split_rod_covariances(cov, n_rods)
@@ -534,7 +539,13 @@ def main():
             print("  FAIL: sink did not fire on every frame"); ok = False
         ok = check_file(args.out, len(frames), n_rods, DEFAULT_POSITION_SCALE) and ok
         report_covariance(counting, len(frames), "rollout")
-        norm = np.linalg.norm(frames[-1]["state"].flatten().tolist()[3:7])
+        # Frames hold the 36-D exp-map state; convert back to quats to check
+        # the orientation is still a unit quaternion.
+        from linearization_exp import exp_state_to_quat_state
+        last_quat_state = exp_state_to_quat_state(
+            frames[-1]["state"]
+        ).detach().cpu().numpy().reshape(-1)
+        norm = float(np.linalg.norm(last_quat_state[3:7]))
         print(f"  quat norm       : {norm:.6f}")
         if abs(norm - 1.0) > 1e-4:
             print("  FAIL: quaternion is not normalized"); ok = False
