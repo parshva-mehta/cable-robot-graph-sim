@@ -37,7 +37,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ekf import OnlineEKF
+from ekf_gtsam import OnlineEKF
 from e2e_check import (build_stub_simulator, load_real_simulator,
                        load_dataset, _build_start_state)
 from sim_data_publisher import (CompositeSink, RodStatePublisher,

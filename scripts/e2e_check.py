@@ -37,6 +37,7 @@ import json
 import sys
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -44,7 +45,7 @@ import torch
 # Allow running as `python3 scripts/e2e_check.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ekf import OnlineEKF, run_ekf_rollout
+from ekf_gtsam import OnlineEKF, run_ekf_rollout
 from sim_data_publisher import (STATE_DIM_PER_ROD, DEFAULT_POSITION_SCALE,
                                 CompositeSink, RodStatePublisher,
                                 RolloutStateFileWriter, rod_names_from_simulator,
@@ -97,17 +98,23 @@ class _StubRobot:
 class StubSimulator:
     """Identity-dynamics stand-in for TensegrityGNNSimulator.
 
-    Implements only what ``ekf.py`` and ``linearization.py`` touch:
-    ``step``, ``robot.{rods,rigid_bodies,actuated_cables}``, ``parameters``,
-    ``ctrls_hist``, ``node_hidden_state``, ``dtype``, ``device``.
+    Implements only what ``ekf.py``, ``ekf_gtsam.py`` and the linearization
+    modules touch: ``step``, ``robot.{rods,rigid_bodies,actuated_cables}``,
+    ``parameters``, ``ctrls_hist``, ``node_hidden_state``, ``dtype``,
+    ``device``, ``data_processor.dt``.
     """
 
-    def __init__(self, rod_names, cable_rest_lengths):
+    def __init__(self, rod_names, cable_rest_lengths, dt=0.01):
         self.robot = _StubRobot(rod_names, cable_rest_lengths)
         self.ctrls_hist = None
         self.node_hidden_state = None
         self.dtype = torch.float32
         self.device = torch.device("cpu")
+        # linearization_exp's structural velocity rows read data_processor.dt,
+        # matching GraphDataProcessor's (1, 1) tensor.
+        self.data_processor = SimpleNamespace(
+            dt=torch.tensor([[dt]], dtype=torch.float32)
+        )
 
     def parameters(self):
         return iter(())  # no params -> linearize_dynamics falls back to f32/cpu

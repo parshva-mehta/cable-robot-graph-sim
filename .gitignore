@@ -3,6 +3,7 @@
 
 # Media
 *.mp4
+*.png
 
 # Python bytecode / caches
 *.pyc
@@ -12,16 +13,18 @@ __pycache__/
 .venv/
 venv/
 
+# OS
+.DS_Store
+
 # --- Generated artifacts (regenerate from code; not version-controlled) ---
 
 # Rollout state dumps written by eval.py
-/rollout_states.txt
-/rollout_states_ekf.txt
-/rollout_states_ekf_exp.txt
+rollout_states*.txt
 
 # Rollout files written by scripts/e2e_check.py / run_all.sh
 /rollout_ekf.txt
 /rollout_ekf_online.txt
+gt_states.txt
 
 # Proof report written by scripts/prove_covariance.py
 /covariance_proof.txt
@@ -32,8 +35,13 @@ diagnostics/jacobians/
 diagnostics/jacobians_exp/
 diagnostics/quaternions/
 diagnostics/exp_vs_quat/
+jacobian_fd_convergence.txt
 
 # EKF covariance proof artifacts
 joint_covariance_tangent_*.txt
 covariance_proof.txt
 joint_jacobian_tangent_*.txt
+
+# Logs / recordings
+logs/
+*.mcap

@@ -13,6 +13,7 @@ simulator (identity dynamics), so no trained ``.pt`` model or dataset is needed.
 Skipped where torch/gtsam are unavailable.
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -28,7 +29,7 @@ pytest.importorskip("gtsam")
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from ekf import OnlineEKF, run_ekf_rollout  # noqa: E402
+from ekf_gtsam import OnlineEKF, run_ekf_rollout  # noqa: E402
 from e2e_check import build_stub_simulator, synthetic_data  # noqa: E402
 
 CONFIG = str(_REPO / "simulators" / "configs" / "3_bar_gnn_sim_config.json")
@@ -107,12 +108,12 @@ def test_run_ekf_rollout_passes_covariance(sim):
     gt, extra = synthetic_data(CONFIG, sim, 3)
     sink = CovRecordingSink()
     run_ekf_rollout(sim, gt, extra, dt=0.01, use_finite_diff=True, publisher=sink)
-    # A covariance is recorded for every frame; whenever present it is the full
-    # 39x39 (3 rods x 13) EKF covariance.
+    # A covariance is recorded for every frame; whenever present it is the
+    # filter's own 36x36 (3 rods x 12) exp-map tangent covariance.
     assert len(sink.covs) == 4
     present = [c for c in sink.covs if c is not None]
     assert present, "expected at least one non-None covariance"
-    assert all(np.asarray(c).shape == (39, 39) for c in present)
+    assert all(np.asarray(c).shape == (36, 36) for c in present)
 
 
 def test_run_ekf_rollout_passes_tangent_jacobian(sim):
@@ -139,9 +140,15 @@ def test_run_ekf_rollout_published_state_matches_frame(sim):
     sink = RecordingSink()
     frames = run_ekf_rollout(sim, gt, extra, dt=0.01,
                              use_finite_diff=True, publisher=sink)
+    # Frames carry the 36-D exp-map state; the sink is published the 39-D
+    # ambient quat state. They must describe the same pose.
+    from linearization_exp import quat_state_to_exp_state
     for frame, (_, published) in zip(frames, sink.calls):
-        assert published == pytest.approx(
-            frame["state"].detach().cpu().numpy().reshape(-1)
+        published_exp = quat_state_to_exp_state(
+            torch.as_tensor(published, dtype=torch.float32).reshape(1, -1, 1)
+        ).detach().cpu().numpy().reshape(-1)
+        assert published_exp == pytest.approx(
+            frame["state"].detach().cpu().numpy().reshape(-1), abs=1e-5
         )
 
 
@@ -188,35 +195,37 @@ def test_online_ekf_passes_covariance(sim):
         ekf.step(z_t=z, u_t=ex["controls"], have_measurement=have_meas)
     present = [c for c in sink.covs if c is not None]
     assert present, "expected at least one non-None covariance"
-    assert all(np.asarray(c).shape == (39, 39) for c in present)
+    assert all(np.asarray(c).shape == (36, 36) for c in present)
 
 
-def test_hemisphere_align_flips_antipodal_quaternion():
-    from ekf import _hemisphere_align_measurement
+def test_quat2exp_canonicalizes_antipodal_quaternion():
+    """q and -q are the same rotation and must map to the same exp-map vector.
 
-    n_rods = 2
-    # Predicted state: identity quats. Measurement (full state, 13/rod): rod 0 is
-    # antipodal (-identity, same rotation), rod 1 already aligned.
-    mean_pred = np.zeros(13 * n_rods)
-    for r in range(n_rods):
-        mean_pred[13 * r + 3] = 1.0  # w = 1
-    z = np.zeros(13 * n_rods)
-    z[3] = -1.0            # rod 0 quat = -identity (antipodal)
-    z[13 + 3] = 1.0        # rod 1 quat = +identity (aligned)
-    out = _hemisphere_align_measurement(z, mean_pred, n_rods)
-    assert out[3] == pytest.approx(1.0)          # rod 0 flipped to +identity
-    assert out[13 + 3] == pytest.approx(1.0)     # rod 1 untouched
-    # Pose-only layout (7/rod): quaternion still at offset 3.
-    zp = np.zeros(7 * n_rods)
-    zp[3] = -1.0
-    outp = _hemisphere_align_measurement(zp, mean_pred, n_rods)
-    assert outp[3] == pytest.approx(1.0)
+    The GTSAM/exp-map filter relies on ``quat2exp`` folding the double cover at
+    the conversion boundary; without it, antipodal-but-identical measurements
+    differ by ~2*pi and produce a spurious innovation.
+    """
+    from utilities.torch_quaternion import quat2exp
+
+    # identity, a 5-degree rotation, and one near 180 degrees (the hard case)
+    for angle_deg in (0.0, 5.0, 179.0):
+        half = math.radians(angle_deg) / 2.0
+        q = torch.tensor([[[math.cos(half)], [math.sin(half)], [0.0], [0.0]]],
+                         dtype=torch.float64)
+        e_pos = quat2exp(q)
+        e_neg = quat2exp(-q)
+        assert e_pos.shape == (1, 3, 1)
+        np.testing.assert_allclose(
+            e_neg.numpy(), e_pos.numpy(), atol=1e-12,
+            err_msg=f"double cover not folded at {angle_deg} deg")
+        # the canonical exp-map norm stays within [0, pi]
+        assert float(e_pos.norm()) <= math.pi + 1e-9
 
 
 def test_double_cover_measurement_does_not_flip_estimate(sim):
     """An antipodal-but-identical orientation measurement must not drag the
-    filtered quaternion toward -q. Before the hemisphere-alignment fix this
-    produced a large spurious innovation."""
+    filtered quaternion toward -q. Without the double-cover fold in
+    ``quat2exp`` this produces a large spurious innovation."""
     gt, extra = synthetic_data(CONFIG, sim, 1)
     n_rods = len(sim.robot.rods)
     start = _start_state(gt[0], n_rods)
@@ -230,7 +239,10 @@ def test_double_cover_measurement_does_not_flip_estimate(sim):
     z = start.detach().cpu().numpy().reshape(-1).astype(float).copy()
     for r in range(n_rods):
         z[13 * r + 3: 13 * r + 7] *= -1.0
-    out = ekf.step(z_t=z, u_t=extra[0]["controls"]).detach().cpu().numpy().reshape(-1)
+    # step() returns the 36-D exp-map state; convert back to quats to compare.
+    from linearization_exp import exp_state_to_quat_state
+    out_exp = ekf.step(z_t=z, u_t=extra[0]["controls"])
+    out = exp_state_to_quat_state(out_exp).detach().cpu().numpy().reshape(-1)
 
     for r in range(n_rods):
         q_pred = start.detach().cpu().numpy().reshape(-1)[13 * r + 3: 13 * r + 7]
@@ -249,4 +261,4 @@ def test_online_ekf_unchanged_when_publisher_none(sim):
                    rest_lengths=extra[0]["rest_lengths"],
                    motor_speeds=extra[0]["motor_speeds"])
     out = ekf.step(z_t=_z(gt[1], n_rods), u_t=extra[0]["controls"])
-    assert out.shape == (1, 39, 1)  # no crash, returns a state
+    assert out.shape == (1, 36, 1)  # no crash, returns an exp-map state

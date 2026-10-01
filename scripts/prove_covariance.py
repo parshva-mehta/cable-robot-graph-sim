@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import roslibpy
 
-from ekf import OnlineEKF
+from ekf_gtsam import OnlineEKF
 from e2e_check import build_stub_simulator, synthetic_data, _build_start_state, _z_from_gt
 from sim_data_publisher import (
     DEFAULT_POSITION_SCALE, build_odometry_msg, rod_names_from_simulator,

@@ -13,10 +13,12 @@ Because exp_rot lives in unconstrained R³, the Jacobian is naturally full-rank
 (36×36) — no tangent-space projection or ε·qqᵀ regularisation needed.
 """
 
+import os
+
 import numpy as np
 import torch
 
-from utilities.torch_quaternion import quat2exp, exp2quat
+from utilities.torch_quaternion import quat2exp, exp2quat, compute_prin_axis, compute_quat_btwn_z_and_vec
 from linearization import (
     N_BODIES,
     BLOCK_SIZE,
@@ -28,6 +30,77 @@ from linearization import (
 
 EXP_BLOCK_SIZE = 12
 EXP_STATE_DIM  = N_BODIES * EXP_BLOCK_SIZE   # 36
+
+# Output-row indices of the pose block (pos + exp_rot) for every rod.
+_POSE_ROWS = np.concatenate(
+    [np.arange(r * EXP_BLOCK_SIZE, r * EXP_BLOCK_SIZE + 6) for r in range(N_BODIES)]
+)
+_ALL_ROWS = np.arange(EXP_STATE_DIM)
+
+# Kill switch for the fast autograd Jacobian path in linearize_dynamics_exp.
+#
+# Fast path (default): one forward pass, then a single batched backward over only
+# the 18 pose rows — the 18 velocity rows are discarded anyway by
+# _structural_velocity_rows.  Measured ~4x faster (416 ms -> 103 ms per Jacobian
+# on CPU) and bit-identical to the reference path (max|dF| = 0.0).
+#
+# Set LINEARIZATION_FAST_JACOBIAN=0 in the environment to fall back to the
+# original row-by-row torch.autograd.functional.jacobian path if the fast path is
+# ever suspected of causing a filter regression.
+FAST_JACOBIAN = os.environ.get("LINEARIZATION_FAST_JACOBIAN", "1") != "0"
+
+
+# ---------------------------------------------------------------------------
+# Structural velocity-row override (Option B)
+# ---------------------------------------------------------------------------
+
+def _structural_velocity_rows(
+    F: np.ndarray,
+    dt: float,
+    n_rods: int = N_BODIES,
+) -> np.ndarray:
+    """Replace non-smooth velocity output rows with analytically derived kinematics.
+
+    The GNN predicts body poses (pos, rot); velocities are kinematic reconstructions:
+        linvel_next  = (pos_next  - pos_in)     / dt
+        angvel_next ≈ (rot_next  - rot_in)     / dt   (first-order exp-map approximation)
+
+    Differentiating these gives:
+        ∂linvel_next/∂x = (∂pos_next/∂x  - D_pos) / dt
+        ∂angvel_next/∂x = (∂rot_next/∂x  - D_rot) / dt
+
+    where D_pos (D_rot) is a selection matrix that picks pos (exp_rot) from x_in.
+    This avoids the acos/1/dt singularity in the naive FD velocity rows.
+
+    The angvel formula is exact for linvel; for angvel it is the first-order
+    exp-map approximation (exact for small Δrot, consistent near identity).
+
+    Args:
+        F:      (EXP_STATE_DIM, EXP_STATE_DIM) Jacobian to modify in-place copy.
+        dt:     simulator timestep (seconds).
+        n_rods: number of rigid bodies (default N_BODIES = 3).
+
+    Returns:
+        F_out with velocity rows replaced analytically; pose rows unchanged.
+    """
+    F_out = F.copy()
+    for r in range(n_rods):
+        base = r * EXP_BLOCK_SIZE
+        pos_out = slice(base + 0, base + 3)
+        rot_out = slice(base + 3, base + 6)
+        lv_out  = slice(base + 6, base + 9)
+        av_out  = slice(base + 9, base + 12)
+
+        D_pos = np.zeros((3, EXP_STATE_DIM))
+        D_pos[:, base + 0:base + 3] = np.eye(3)
+
+        D_rot = np.zeros((3, EXP_STATE_DIM))
+        D_rot[:, base + 3:base + 6] = np.eye(3)
+
+        F_out[lv_out, :] = (F[pos_out, :] - D_pos) / dt
+        F_out[av_out, :] = (F[rot_out, :] - D_rot) / dt
+
+    return F_out
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +128,41 @@ def quat_state_to_exp_state(state_quat: torch.Tensor) -> torch.Tensor:
 
     quat_flat = quat.reshape(batch * N_BODIES, 4, 1)
     exp_rot   = quat2exp(quat_flat).reshape(batch, N_BODIES, 3, 1)
+
+    exp_state = torch.cat([pos, exp_rot, vel], dim=2).reshape(batch, EXP_STATE_DIM, 1)
+    return exp_state.squeeze(-1) if squeeze else exp_state
+
+
+def quat_state_to_canonical_exp_state(state_quat: torch.Tensor) -> torch.Tensor:
+    """Convert ambient quat state (39D) to canonical GNN exp-map state (36D).
+
+    Unlike quat_state_to_exp_state, this canonicalizes each rod quaternion to the
+    GNN's principal-axis form (minimal rotation from z-axis to the rod's long axis),
+    discarding axial spin which is unobservable from the GNN dynamics.
+
+    Use only when comparing ground-truth quaternions (from physics simulation) against
+    GNN-estimated states — they use different orientation conventions.
+
+    Args:
+        state_quat: (batch, 39, 1)
+    Returns:
+        (batch, 36, 1)
+    """
+    squeeze = (state_quat.dim() == 2)
+    if squeeze:
+        state_quat = state_quat.unsqueeze(-1)
+
+    batch = state_quat.shape[0]
+    s = state_quat.reshape(batch, N_BODIES, BLOCK_SIZE, 1)
+
+    pos     = s[:, :, 0:3,  :]
+    quat    = s[:, :, 3:7,  :]
+    vel     = s[:, :, 7:13, :]
+
+    quat_flat  = quat.reshape(batch * N_BODIES, 4, 1)
+    prin_axis  = compute_prin_axis(quat_flat)[..., 0]           # (B*N, 3)
+    q_can      = compute_quat_btwn_z_and_vec(prin_axis)         # (B*N, 4)
+    exp_rot    = quat2exp(q_can.unsqueeze(-1)).reshape(batch, N_BODIES, 3, 1)
 
     exp_state = torch.cat([pos, exp_rot, vel], dim=2).reshape(batch, EXP_STATE_DIM, 1)
     return exp_state.squeeze(-1) if squeeze else exp_state
@@ -115,17 +223,105 @@ def step_exp(model,
 # Jacobian in exp-map space
 # ---------------------------------------------------------------------------
 
+def compute_nominal_step_exp(
+    model,
+    state_exp,
+    sample_index: int = 0,
+    ctrls=None,
+) -> np.ndarray:
+    """Run one GNN forward pass in exp-map space, returning only the next state.
+
+    Cheaper than linearize_dynamics_exp — no Jacobian is computed.
+    Used on EKF steps where F is served from the cache.
+    """
+    if isinstance(state_exp, torch.Tensor):
+        state_exp_np = state_exp.detach().cpu().numpy().flatten().astype(np.float64)
+    else:
+        state_exp_np = np.asarray(state_exp, dtype=np.float64).flatten()
+
+    try:
+        ref = next(model.parameters())
+        dtype, dev = ref.dtype, ref.device
+    except StopIteration:
+        dtype, dev = torch.float32, torch.device('cpu')
+
+    dataset_idx   = torch.tensor([[sample_index]], dtype=torch.long, device=dev)
+    s2g_kwargs    = {'dataset_idx': dataset_idx}
+    ctrls_t       = _build_zero_ctrls(model, dtype, dev)
+    nominal_ctrls = ctrls if ctrls is not None else ctrls_t
+
+    x_t = torch.tensor(state_exp_np, dtype=dtype, device=dev).reshape(1, EXP_STATE_DIM, 1)
+    with torch.no_grad():
+        ns = step_exp(model, x_t, nominal_ctrls, s2g_kwargs)
+    return ns[0, :EXP_STATE_DIM, 0].detach().cpu().numpy().astype(np.float64)
+
+
+def _clamp_spectral_radius(
+    J: np.ndarray,
+    max_spectral_radius: float = 1.0,
+) -> tuple[np.ndarray, float, float]:
+    """Clamp individual eigenvalues of J that exceed max_spectral_radius.
+
+    Unlike global scaling (J * r/sr), only stiff directions are shrunk;
+    well-conditioned directions are left untouched.  Falls back to global
+    scaling when the eigenvector matrix V is ill-conditioned (cond > 1e10),
+    which can occur when a few cable/contact directions dominate the spectrum.
+
+    Returns (J_clamped, sr_raw, sr_fixed).
+    """
+    eigenvalues, V = np.linalg.eig(J)
+    sr_raw = float(np.max(np.abs(eigenvalues)))
+    if sr_raw <= max_spectral_radius:
+        return J, sr_raw, sr_raw
+
+    mags = np.abs(eigenvalues)
+    # Guard against zero-magnitude eigenvalues: np.where evaluates both branches
+    # before masking, so division by zero occurs even when the mask is False.
+    safe_mags = np.where(mags > 0, mags, np.finfo(np.float64).tiny)
+    scale = np.where(mags > max_spectral_radius, max_spectral_radius / safe_mags, 1.0)
+    eigenvalues_clamped = eigenvalues * scale
+
+    try:
+        cond_V = np.linalg.cond(V)
+        if not np.isfinite(cond_V) or cond_V > 1e10:
+            raise np.linalg.LinAlgError(f"V ill-conditioned (cond={cond_V:.2e})")
+        V_inv = np.linalg.inv(V)
+        J_clamped = np.real(V @ np.diag(eigenvalues_clamped) @ V_inv)
+    except np.linalg.LinAlgError:
+        # Eigenvector matrix is degenerate; fall back to global scaling.
+        J_clamped = J * (max_spectral_radius / sr_raw)
+
+    sr_fixed = float(np.max(np.abs(np.linalg.eigvals(J_clamped))))
+    return J_clamped, sr_raw, sr_fixed
+
+
 def linearize_dynamics_exp(
     model,
     state_exp,
     sample_index: int = 0,
     use_finite_diff: bool = False,
+    ctrls=None,
+    max_spectral_radius: float | None = None,
+    verbose: bool = False,
+    structural_velocity_rows: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Linearize the exp-map-wrapped one-step dynamics at *state_exp*.
 
+    structural_velocity_rows (default True):
+        Replace the non-smooth FD velocity-output rows (linvel/angvel) with
+        analytically derived kinematic rows from _structural_velocity_rows.
+        The GNN predicts poses only; velocities are 1/dt reconstructions, so
+        naive FD through them is non-convergent.  The analytical rows use only
+        the clean pose-block rows and are well-conditioned.
+
+    max_spectral_radius (default None = no clamping):
+        When set, eigenvalues of J exceeding this magnitude are clamped.
+        Leave as None for Jacobian accuracy; set in the EKF if filter
+        instability is observed.
+
     Returns
     -------
-    next_state_exp : (36,) float64 ndarray
+    next_state_exp : (36,) float64 ndarray  — computed with *ctrls* (or zero if None)
     J_exp          : (36, 36) float64 ndarray — naturally full-rank
     """
     if isinstance(state_exp, torch.Tensor):
@@ -143,25 +339,71 @@ def linearize_dynamics_exp(
     dataset_idx = torch.tensor([[sample_index]], dtype=torch.long, device=dev)
     s2g_kwargs  = {'dataset_idx': dataset_idx}
     ctrls_t     = _build_zero_ctrls(model, dtype, dev)
+    nominal_ctrls = ctrls if ctrls is not None else ctrls_t
 
-    def _fwd_np(x_np: np.ndarray) -> np.ndarray:
+    def _fwd_np(x_np: np.ndarray, c=ctrls_t) -> np.ndarray:
         x_t = torch.tensor(x_np, dtype=dtype, device=dev).reshape(1, EXP_STATE_DIM, 1)
         with torch.no_grad():
-            ns = step_exp(model, x_t, ctrls_t, s2g_kwargs)
+            ns = step_exp(model, x_t, c, s2g_kwargs)
         return ns[0, :EXP_STATE_DIM, 0].detach().cpu().numpy().astype(np.float64)
 
-    if not use_finite_diff:
+    if not use_finite_diff and FAST_JACOBIAN:
+        # --- Fast autograd path (see FAST_JACOBIAN note above) -----------------
+        # Restore context once before the forward pass.  The forward runs exactly
+        # once; the backward VJPs do not re-enter step_exp, so model side-effects
+        # (ctrls_hist, hidden_state) are safe.
+        # torch.func.jacrev / vmap over the *forward* is still intentionally
+        # avoided: it requires a pure function but step_exp mutates model state,
+        # causing ~10 000x inflated spurious gradients.  is_grads_batched vmaps
+        # only the backward graph, which is pure, so it is safe.
+        _restore_model_ctx(model, ctx)
+
+        # enable_grad is required: callers (run_ekf_rollout, OnlineEKF.step) invoke
+        # this under torch.no_grad().  The reference path below is immune because
+        # torch.autograd.functional.jacobian re-enables grad internally.
+        with torch.enable_grad():
+            state_in = torch.tensor(state_exp_np, dtype=dtype, device=dev,
+                                    requires_grad=True)
+            y = step_exp(model, state_in.reshape(1, EXP_STATE_DIM, 1),
+                         nominal_ctrls, s2g_kwargs)[0, :EXP_STATE_DIM, 0]
+
+            # Only the pose rows (pos + exp_rot per rod) are needed when the
+            # velocity rows are rebuilt analytically below —
+            # _structural_velocity_rows overwrites them entirely from the pose
+            # rows, so computing the 18 velocity rows here and then discarding
+            # them doubles the backward cost for nothing.
+            rows = _POSE_ROWS if structural_velocity_rows else _ALL_ROWS
+
+            # One batched backward over all rows instead of a Python loop.
+            G = torch.zeros(len(rows), EXP_STATE_DIM, dtype=y.dtype, device=y.device)
+            G[torch.arange(len(rows)), torch.as_tensor(rows, device=y.device)] = 1.0
+            (grads,) = torch.autograd.grad(y, state_in, G, is_grads_batched=True)
+
+        J_np = np.zeros((EXP_STATE_DIM, EXP_STATE_DIM), dtype=np.float64)
+        J_np[rows] = grads.detach().cpu().numpy().astype(np.float64)
+
+        # The forward pass above already produced the nominal next state from the
+        # restored context, so the separate _fwd_np call is not needed.
+        next_state_np = y.detach().cpu().numpy().astype(np.float64)
+
+    elif not use_finite_diff:
+        # --- Reference autograd path (FAST_JACOBIAN=0) ------------------------
+        # Row-by-row jacobian over all 36 outputs plus a separate nominal forward
+        # pass.  Kept as the fallback/oracle for the fast path above.
+        _restore_model_ctx(model, ctx)
+
         def step_fn(x_flat: torch.Tensor) -> torch.Tensor:
-            _restore_model_ctx(model, ctx)
             x = x_flat.reshape(1, EXP_STATE_DIM, 1)
-            ns = step_exp(model, x, ctrls_t, s2g_kwargs)
+            ns = step_exp(model, x, nominal_ctrls, s2g_kwargs)
             return ns[0, :EXP_STATE_DIM, 0]
 
         state_in = torch.tensor(state_exp_np, dtype=dtype, device=dev)
-        J_np     = torch.func.jacrev(step_fn)(state_in).detach().cpu().numpy().astype(np.float64)
+        J_np = torch.autograd.functional.jacobian(
+            step_fn, state_in, vectorize=False
+        ).detach().cpu().numpy().astype(np.float64)
 
         _restore_model_ctx(model, ctx)
-        next_state_np = _fwd_np(state_exp_np)
+        next_state_np = _fwd_np(state_exp_np, nominal_ctrls)
 
     else:
         eps_pos = 1e-4
@@ -170,7 +412,7 @@ def linearize_dynamics_exp(
         J_np = np.zeros((EXP_STATE_DIM, EXP_STATE_DIM), dtype=np.float64)
 
         _restore_model_ctx(model, ctx)
-        next_state_np = _fwd_np(state_exp_np)
+        next_state_np = _fwd_np(state_exp_np, nominal_ctrls)
 
         for j in range(EXP_STATE_DIM):
             off = j % EXP_BLOCK_SIZE
@@ -180,9 +422,9 @@ def linearize_dynamics_exp(
             sb = state_exp_np.copy(); sb[j] -= eps
 
             _restore_model_ctx(model, ctx)
-            nsf = _fwd_np(sf)
+            nsf = _fwd_np(sf, nominal_ctrls)
             _restore_model_ctx(model, ctx)
-            nsb = _fwd_np(sb)
+            nsb = _fwd_np(sb, nominal_ctrls)
 
             J_np[:, j] = (nsf - nsb) / (2.0 * eps)
 
@@ -190,5 +432,14 @@ def linearize_dynamics_exp(
     # call simulator.step() with actual controls without seeing corrupted
     # state left over from the last forward pass above.
     _restore_model_ctx(model, ctx)
+
+    if structural_velocity_rows:
+        dt_val = float(model.data_processor.dt.squeeze())
+        J_np = _structural_velocity_rows(J_np, dt_val, N_BODIES)
+
+    if max_spectral_radius is not None:
+        J_np, sr_raw, sr_fixed = _clamp_spectral_radius(J_np, max_spectral_radius)
+        if verbose and sr_raw > max_spectral_radius * 1.01:
+            print(f"  [exp SR clamp] raw SR={sr_raw:.4f} → clamped to {sr_fixed:.4f}")
 
     return next_state_np, J_np
