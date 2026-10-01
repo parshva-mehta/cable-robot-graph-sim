@@ -163,7 +163,10 @@ Entry points: `run_all.sh` (drives the whole pipeline end to end, `--stream` for
 
 | Branch | Description |
 |--------|-------------|
-| `main` | Stable baseline |
-| `MEKF` | Manual MEKF implementation (`ekf.py`) |
-| `GSTAM` | GTSAM-MEKF parallel (`ekf_gtsam.py`, `scripts/gtsam_refiner_eval.py`) |
+| `main` | Current line of development: GTSAM-MEKF filter (`ekf_gtsam.py`) + the EKF→ROS bridge. The manual MEKF (`ekf.py`) ships alongside it and supplies the shared helpers. |
+| `MEKF` | Historical: manual MEKF implementation before it merged into `main` |
+| `GSTAM` | Historical: GTSAM-MEKF development before it merged into `main` |
 | `ekf-fixes` | EKF bug-fix history |
+
+`main` absorbed the `GSTAM` line; that branch's own history carries pre-rebase
+commit SHAs and is no longer the place to build on.
